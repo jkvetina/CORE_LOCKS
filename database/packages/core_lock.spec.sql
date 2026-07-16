@@ -1,6 +1,6 @@
 CREATE OR REPLACE PACKAGE core_lock AS
 
-    -- same code CORE used, so an APEX error handler tuned to CORE keeps
+    -- same code CORE23 used, so an APEX error handler tuned to CORE23 keeps
     -- recognizing locking errors after this package is installed standalone
     c_app_exception_code    CONSTANT PLS_INTEGER := -20990;
     --

@@ -22,7 +22,7 @@
 
 It hooks every DDL statement in the schema, records who ran it, keeps a copy of the source, and refuses a compile when someone else already holds a live lock on that object. Two developers compiling the same package no longer silently overwrite each other — the second one gets an error instead of a surprise.
 
-This repo is extracted from the author's [CORE](https://github.com/jkvetina/CORE) framework. In CORE, the LOCK feature depends on the `CORE` and `CORE_CUSTOM` packages plus the `CORE_LOGS` table — roughly 6,300 lines of framework for what is really a self-contained idea. This version cuts that away.
+This repo is extracted from the author's [CORE23](https://github.com/jkvetina/CORE23) framework. In CORE23, the LOCK feature depends on the `CORE` and `CORE_CUSTOM` packages plus the `CORE_LOGS` table — roughly 6,300 lines of framework for what is really a self-contained idea. This version cuts that away.
 
 **Key characteristics:**
 
@@ -130,7 +130,7 @@ core_lock.extend_lock(in_lock_id => 10001, in_expire_at => SYSDATE + 1);
 
 ### Raise error
 
-`raise_error` raises `ORA-20990` carrying the message, with `keeperrorstack` on. It is public because the trigger calls it from its own `WHEN OTHERS`. The matching `core_lock.app_exception` is pinned to the same code, so an APEX error handler already tuned to CORE keeps recognizing these errors unchanged.
+`raise_error` raises `ORA-20990` carrying the message, with `keeperrorstack` on. It is public because the trigger calls it from its own `WHEN OTHERS`. The matching `core_lock.app_exception` is pinned to the same code, so an APEX error handler already tuned to CORE23 keeps recognizing these errors unchanged.
 
 ### Helpers
 
