@@ -1,0 +1,139 @@
+CREATE OR REPLACE PACKAGE core_custom
+AUTHID CURRENT_USER RESETTABLE
+AS
+
+    --
+    -- CONSTANTS SHARED IN BETWEEN ALL APPS, WHICH YOU SET JUST ONCE
+    --
+
+    -- global prefix for database objects
+    global_prefix               CONSTANT VARCHAR2(30)   := '';
+
+    -- remove string from env name
+    env_name_strip              CONSTANT VARCHAR2(30)   := '';
+
+    -- id for the Master application
+    master_id                   CONSTANT PLS_INTEGER    := 9000;
+    master_debug_page           CONSTANT PLS_INTEGER    := 811;
+    master_debug_item           CONSTANT VARCHAR2(30)   := 'P811_LOG_ID';
+
+    -- package name holding constants, used as get_constant() default
+    master_owner                CONSTANT VARCHAR2(30)   := 'HUB';
+    master_constants            CONSTANT VARCHAR2(30)   := 'CORE_CUSTOM';
+
+    -- specify special pages
+    page_id_help                CONSTANT PLS_INTEGER    := 980;
+    page_id_login               CONSTANT PLS_INTEGER    := 9999;
+
+    -- default logging level (for non-APEX sessions)
+    default_debug_level         CONSTANT PLS_INTEGER    := 7;
+
+    -- code for app exception
+    app_exception_code          CONSTANT PLS_INTEGER    := -20990;
+    assert_exception_code       CONSTANT PLS_INTEGER    := -20992;
+
+    -- flags use in logging
+    flag_apex                   CONSTANT CHAR           := 'X';     -- error from APEX error handling function
+    flag_error                  CONSTANT CHAR           := 'E';     -- error from raise_error, log_error
+    flag_warning                CONSTANT CHAR           := 'W';     -- warning from log_warning
+    flag_debug                  CONSTANT CHAR           := 'D';     -- debug... you can guess the name
+    flag_start                  CONSTANT CHAR           := 'S';     -- start of any module (procedure/function), log_start
+    flag_end                    CONSTANT CHAR           := 'Q';     -- end of the module (with timer), log_end
+
+    -- start assert messages with these prefixes
+    global_assert_message       CONSTANT VARCHAR2(30)   := 'ASSERT_FAILED|';
+    global_constraint_prefix    CONSTANT VARCHAR2(30)   := 'CONSTRAINT_ERROR|';
+    global_not_null_prefix      CONSTANT VARCHAR2(30)   := 'NOT_NULL|';
+
+    -- formats used by your packages and app substitutions
+    format_date                 CONSTANT VARCHAR2(32)   := 'YYYY-MM-DD';
+    format_date_time            CONSTANT VARCHAR2(32)   := 'YYYY-MM-DD HH24:MI:SS';
+    format_date_short           CONSTANT VARCHAR2(32)   := 'YYYY-MM-DD HH24:MI';
+    format_time                 CONSTANT VARCHAR2(32)   := 'HH24:MI:SS';
+    format_time_short           CONSTANT VARCHAR2(32)   := 'HH24:MI';
+    format_number               CONSTANT VARCHAR2(32)   := 'FM999G999G999G999G999G990D00';
+    format_number_currency      CONSTANT VARCHAR2(32)   := 'FML999G999G999G999G999G990D00';
+    format_integer              CONSTANT VARCHAR2(32)   := 'FM999G999G999G999G999G990';
+    format_integer_currency     CONSTANT VARCHAR2(32)   := 'FML999G999G999G999G999G990';
+
+    -- global item names
+    global_success              CONSTANT VARCHAR2(30)   := 'G_SUCCESS_MESSAGE';
+    global_context_app          CONSTANT VARCHAR2(30)   := 'G_CONTEXT_APP';
+    global_context_page         CONSTANT VARCHAR2(30)   := 'G_CONTEXT_PAGE';
+    global_request_id           CONSTANT VARCHAR2(30)   := 'G_REQUEST_ID';
+    global_workspace            CONSTANT VARCHAR2(30)   := 'G_WORKSPACE';
+    global_env                  CONSTANT VARCHAR2(30)   := 'G_ENV';
+    global_user_name            CONSTANT VARCHAR2(30)   := 'G_USER_NAME';
+    global_user_email           CONSTANT VARCHAR2(30)   := 'G_USER_EMAIL';
+    global_formats              CONSTANT VARCHAR2(30)   := 'FORMAT_';
+
+    -- for old school http requests
+    global_app_proxy            CONSTANT VARCHAR2(128)  := '';
+    global_app_wallet           CONSTANT VARCHAR2(128)  := '';
+
+    -- for old school sending emails
+    global_smtp_from            CONSTANT VARCHAR2(128)  := '';
+    global_smtp_host            CONSTANT VARCHAR2(128)  := '';
+    global_smtp_port            CONSTANT NUMBER(8)      := NULL;
+    global_smtp_timeout         CONSTANT NUMBER(8)      := NULL;
+    global_smtp_username        CONSTANT VARCHAR2(128)  := '';
+    global_smtp_password        CONSTANT VARCHAR2(128)  := '';
+
+    -- filter all objects
+    g_owner_like                CONSTANT VARCHAR2(16)   := '%';
+    --
+    g_sender_dev                CONSTANT VARCHAR2(128)  := '';
+    g_sender_uat                CONSTANT VARCHAR2(128)  := '';
+    g_sender_prod               CONSTANT VARCHAR2(128)  := '';
+    g_sender                    CONSTANT VARCHAR2(128)  := '';
+
+    -- receivers for daily emails
+    g_project_name              CONSTANT VARCHAR2(128)  := '';
+    g_copyright                 CONSTANT VARCHAR2(128)  := '';
+    g_job_class                 CONSTANT VARCHAR2(128)  := '';
+
+    -- main application to create APEX session
+    g_app_id                    CONSTANT PLS_INTEGER    := master_id;
+
+    -- list of apps to scan (to ignore working copies, clones and test apps)
+    g_apps apex_t_varchar2 := apex_t_varchar2(
+        master_id
+    );
+
+    -- list of developers to receive reports from all environments
+    g_developers_like           CONSTANT VARCHAR2(128)  := '%';
+    g_developers                apex_t_varchar2 := apex_t_varchar2(
+        'jan.kvetina@gmail.com'
+    );
+
+
+
+    --
+    -- YOUR CUSTOMIZATIONS FOR SOME CORE FUNCTIONS
+    --
+
+    FUNCTION get_env
+    RETURN VARCHAR2;
+
+
+
+    FUNCTION get_user_id
+    RETURN VARCHAR2;
+
+
+
+    FUNCTION get_tenant_id (
+        in_user_id      VARCHAR2 := NULL
+    )
+    RETURN NUMBER;
+
+
+
+    FUNCTION get_sender (
+        in_env              VARCHAR2 := NULL
+    )
+    RETURN VARCHAR2;
+
+END;
+/
+
