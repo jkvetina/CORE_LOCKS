@@ -1,5 +1,20 @@
 CREATE OR REPLACE PACKAGE core_lock AS
 
+    -- same code CORE used, so an APEX error handler tuned to CORE keeps
+    -- recognizing locking errors after this package is installed standalone
+    c_app_exception_code    CONSTANT PLS_INTEGER := -20990;
+    --
+    app_exception           EXCEPTION;
+    PRAGMA EXCEPTION_INIT(app_exception, -20990);
+
+
+
+    PROCEDURE raise_error (
+        in_message          VARCHAR2 := NULL
+    );
+
+
+
     FUNCTION get_user
     RETURN core_locks.locked_by%TYPE;
 

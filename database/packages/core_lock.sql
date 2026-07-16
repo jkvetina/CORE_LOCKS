@@ -6,6 +6,25 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
 
+    PROCEDURE raise_error (
+        in_message          VARCHAR2 := NULL
+    )
+    AS
+        v_message           VARCHAR2(2048);
+    BEGIN
+        -- called bare from WHEN OTHERS handlers, where SQLERRM carries the error
+        v_message := COALESCE (
+            in_message,
+            CASE WHEN SQLERRM NOT LIKE 'ORA-0000:%' THEN SQLERRM END,
+            'CORE_LOCK_ERROR'
+        );
+
+        -- keeperrorstack, since nothing logs the backtrace before we raise
+        RAISE_APPLICATION_ERROR(c_app_exception_code, SUBSTR(v_message, 1, 2048), TRUE);
+    END;
+
+
+
     FUNCTION get_user
     RETURN core_locks.locked_by%TYPE
     AS
@@ -50,7 +69,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         -- check if we have a valid user
         rec.locked_by := COALESCE(in_locked_by, get_user());
         IF rec.locked_by IS NULL THEN
-            core.raise_error('USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID');
+            raise_error('USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID');
         END IF;
 
         -- get current object
@@ -92,13 +111,13 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 --
             ELSIF c.expire_at >= SYSDATE THEN
                 -- for different user we need to check the expire date first
-                core.raise_error('LOCK_TIME_ERROR: OBJECT_LOCKED_BY `' || c.locked_by || '` [' || c.lock_id || ']');
+                raise_error('LOCK_TIME_ERROR: OBJECT_LOCKED_BY `' || c.locked_by || '` [' || c.lock_id || ']');
                 --
             ELSIF v_hash_check AND c.object_hash IS NOT NULL AND c.object_hash != rec.object_hash AND c.locked_at + 1/1440 > SYSDATE THEN
                 -- check object hash
                 -- when you take over an object, you should compile it right away, without any changes
                 -- that will make sure you are not overriding any changes done by someone else in the meantime
-                core.raise_error('LOCK_HASH_ERROR: OBJECT_CHANGED_BY `' || c.locked_by || TO_CHAR(c.expire_at, 'YYYY-MM-DD HH24:MI') || '` [' || c.lock_id || ']');
+                raise_error('LOCK_HASH_ERROR: OBJECT_CHANGED_BY `' || c.locked_by || TO_CHAR(c.expire_at, 'YYYY-MM-DD HH24:MI') || '` [' || c.lock_id || ']');
             END IF;
         END LOOP;
 
@@ -132,12 +151,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         COMMIT;
         --
     EXCEPTION
-    WHEN core.app_exception THEN
+    WHEN app_exception THEN
         ROLLBACK;
         RAISE;
     WHEN OTHERS THEN
         ROLLBACK;
-        core.raise_error();
+        raise_error();
     END;
 
 
@@ -165,12 +184,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         COMMIT;
         --
     EXCEPTION
-    WHEN core.app_exception THEN
+    WHEN app_exception THEN
         ROLLBACK;
         RAISE;
     WHEN OTHERS THEN
         ROLLBACK;
-        core.raise_error();
+        raise_error();
     END;
 
 
@@ -198,12 +217,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         COMMIT;
         --
     EXCEPTION
-    WHEN core.app_exception THEN
+    WHEN app_exception THEN
         ROLLBACK;
         RAISE;
     WHEN OTHERS THEN
         ROLLBACK;
-        core.raise_error();
+        raise_error();
     END;
 
 
@@ -219,7 +238,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         --
     BEGIN
         IF in_lock_id IS NULL AND in_locked_by IS NULL AND in_object_name IS NULL THEN
-            core.raise_error('ARGUMENTS_MISSING');
+            raise_error('ARGUMENTS_MISSING');
         END IF;
         --
         FOR c IN (
@@ -263,12 +282,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         COMMIT;
         --
     EXCEPTION
-    WHEN core.app_exception THEN
+    WHEN app_exception THEN
         ROLLBACK;
         RAISE;
     WHEN OTHERS THEN
         ROLLBACK;
-        core.raise_error();
+        raise_error();
     END;
 
 
@@ -345,7 +364,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         RETURN DBMS_CRYPTO.HASH(in_payload, NVL(in_type, DBMS_CRYPTO.HASH_SH256));
     EXCEPTION
     WHEN OTHERS THEN
-        core.raise_error();
+        raise_error();
     END;
 
 END;
