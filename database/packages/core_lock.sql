@@ -136,7 +136,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 in_lock_id => rec.lock_id
             );
         ELSE
-            rec.lock_id         := core_lock_id.NEXTVAL;
+            -- lock_id stays NULL, the identity column assigns it on insert
             rec.object_owner    := in_object_owner;
             rec.object_type     := in_object_type;
             rec.object_name     := in_object_name;
