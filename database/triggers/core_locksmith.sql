@@ -16,19 +16,6 @@ BEGIN
         NULL;
     END;
 
-    -- log the event in the audit log, here, we it is fine to log just in the generic log
-    core.log_start (
-        'event',            ORA_SYSEVENT,
-        'object_owner',     ORA_DICT_OBJ_OWNER,
-        'object_type',      ORA_DICT_OBJ_TYPE,
-        'object_name',      ORA_DICT_OBJ_NAME,
-        'user',             rec.locked_by,
-        'user_host',        SYS_CONTEXT('USERENV', 'HOST'),
-        'user_ip',          SYS_CONTEXT('USERENV', 'IP_ADDRESS'),
-        'user_lang',        REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'LANGUAGE'), '^([^\.]+)', 1, 1, NULL, 1),
-        'user_zone',        SESSIONTIMEZONE
-    );
-
     -- evaluate only specific events and specific object types
     IF ORA_SYSEVENT IN ('CREATE', 'ALTER', 'DROP')
         AND ORA_DICT_OBJ_TYPE IN (
@@ -47,10 +34,10 @@ BEGIN
     END IF;
     --
 EXCEPTION
-WHEN core.app_exception THEN
+WHEN core_lock.app_exception THEN
     RAISE;
 WHEN OTHERS THEN
-    core.raise_error();
+    core_lock.raise_error();
 END;
 /
 
