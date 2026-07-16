@@ -162,7 +162,7 @@ Lock numbering starts at 10000, assigned by the identity column on `core_locks.l
 ALTER TRIGGER core_locksmith DISABLE;   -- comes back within 5 minutes
 ```
 
-To actually stop the feature you must drop the job as well:
+To actually stop the feature you must disable the job as well:
 
 ```sql
 BEGIN
