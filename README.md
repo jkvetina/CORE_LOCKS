@@ -1,8 +1,10 @@
 # CORE_LOCKS
 
-**Object locking and source backup for shared Oracle schemas — standalone, no framework required**
+## Object locking and source backup for shared Oracle schemas — standalone, no framework required
 
----
+<br>
+<p><img src="docs/one_pager_comix.png" alt="CORE_LOCKS comix"></p>
+<br>
 
 ## Table of Contents
 
@@ -15,8 +17,6 @@
 7. [Operational Notes](#7-operational-notes)
 
 ---
-
-<p align="center"><img src="docs/one_pager_comix.png" alt="CORE_LOCKS comic" width="480"></p>
 
 ## 1. Project Overview
 
