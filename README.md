@@ -16,6 +16,8 @@
 
 ---
 
+<p align="center"><img src="docs/one_pager_comix.png" alt="CORE_LOCKS comic" width="480"></p>
+
 ## 1. Project Overview
 
 **CORE_LOCKS** answers a single question on a shared development schema: *who last touched this object, and am I about to overwrite their work?*
