@@ -25,7 +25,7 @@ COMMENT ON COLUMN core_locks.locked_by          IS 'Lock owner, from get_user():
 COMMENT ON COLUMN core_locks.locked_at          IS 'When this row was cut. Rebook anchor: a compile later than locked_at + g_lock_rebook closes this row and starts a new one.';
 COMMENT ON COLUMN core_locks.expire_at          IS 'Lock is live until this time. NULL means released by unlock, a past value means expired; both let another user take the object.';
 COMMENT ON COLUMN core_locks.counter            IS 'How many times extend_lock refreshed this row, i.e. compiles inside the rebook window. 1 at insert.';
-COMMENT ON COLUMN core_locks.object_payload     IS 'DDL text of the last compile in this rebook window, normalized by get_object(). This is the source backup.';
-COMMENT ON COLUMN core_locks.object_hash        IS 'SHA-256 of object_payload as hex. NULL for object types without source, and cleared by unlock.';
+COMMENT ON COLUMN core_locks.object_payload     IS 'DDL text of the last compile in this rebook window, normalized by get_object(). This is the source backup; the CORE_LOCKS_PURGE job ditches it once the row leaves the 7-day retention window.';
+COMMENT ON COLUMN core_locks.object_hash        IS 'SHA-256 of object_payload as hex. NULL for object types without source, and cleared by unlock. Survives the purge job — one hash per unique object is kept.';
 COMMENT ON COLUMN core_locks.audit_trail        IS 'IP_ADDRESS|HOST|SESSIONTIMEZONE|MODULE of the session that cut this row. Set at insert only, never refreshed by extend_lock.';
 

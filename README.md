@@ -28,7 +28,7 @@ This repo is extracted from the author's [CORE23](https://github.com/jkvetina/CO
 
 **Key characteristics:**
 
-- **Four objects** — one table, one package, one trigger, one job
+- **Five objects** — one table, one package, one trigger, two jobs
 - **No framework** — no `CORE`, no `CORE_CUSTOM`, no logging tables
 - **Source backup included** — every lock row carries a copy of the object's DDL
 - **Drop-in** — install into any schema that has APEX available
@@ -62,9 +62,10 @@ database/packages/core_lock.spec.sql
 database/packages/core_lock.sql
 database/triggers/core_locksmith.sql
 database/jobs/core_locksmith_enable.sql
+database/jobs/core_locks_purge.sql
 ```
 
-The job is optional but recommended; see [Operational Notes](#7-operational-notes) for what it does and why it matters.
+Both jobs are optional but recommended; see [Operational Notes](#7-operational-notes) for what they do and why they matter.
 
 ---
 
@@ -86,7 +87,7 @@ It then reads the most recent lock row for that object and decides:
 
 The hash check is the subtle one. When you take an object over from someone else, compile it once **unchanged** first. That proves your source matches what is actually in the database, and only then should you apply your edits — otherwise you are compiling over changes made while you were not looking.
 
-Because each rebook writes a new row rather than updating in place, `core_locks` accumulates a history of the object's source over time, not just its current state.
+Because each rebook writes a new row rather than updating in place, `core_locks` accumulates a history of the object's source over time, not just its current state. That history is kept in full for the last 7 days; beyond that the `CORE_LOCKS_PURGE` job collapses it to one hash-only row per object (see [Operational Notes](#7-operational-notes)).
 
 ---
 
@@ -130,6 +131,14 @@ core_lock.extend_lock(in_lock_id => 10001, in_time => 60/1440);   -- +60 minutes
 core_lock.extend_lock(in_lock_id => 10001, in_expire_at => SYSDATE + 1);
 ```
 
+### Purge
+
+`purge_locks` is the retention rule, run daily at 03:00 by the `CORE_LOCKS_PURGE` job. Rows younger than `g_purge_after` (7 days) are never touched, and neither is any still-live lock. Beyond the window, each unique object collapses to its newest row — that row keeps the SHA-256 hash, owner, and timestamps but has its `object_payload` CLOB set to NULL; the older history rows are deleted. Safe to run by hand; it reports its row counts through `DBMS_OUTPUT`.
+
+```sql
+core_lock.purge_locks();
+```
+
 ### Raise error
 
 `raise_error` raises `ORA-20990` carrying the message, with `keeperrorstack` on. It is public because the trigger calls it from its own `WHEN OTHERS`. The matching `core_lock.app_exception` is pinned to the same code, so an APEX error handler already tuned to CORE23 keeps recognizing these errors unchanged.
@@ -149,6 +158,7 @@ Constants at the top of the package body:
 | `g_lock_length` | 20 minutes | How long a new lock stays live |
 | `g_lock_rebook` | 10 minutes | Age past which a new backup row is cut instead of extending |
 | `g_check_hash` | `TRUE` | Master switch for the source-hash comparison |
+| `g_purge_after` | 7 days | History younger than this is never purged |
 
 Lock numbering starts at 10000, assigned by the identity column on `core_locks.lock_id`.
 
@@ -176,4 +186,12 @@ END;
 
 **It affects everyone on the schema, not just you.** On a shared dev database, installing this changes the deployment experience for every developer and every automated pipeline touching that schema. That is the feature working as intended, but it is a team decision rather than a personal one.
 
-**`core_locks` grows.** Every rebook writes a new row carrying a full CLOB copy of the object source. That history is the backup, so it should not be purged blindly — but it is worth watching the segment size and deciding a retention rule deliberately.
+**`core_locks` grows — the purge job caps it.** Every rebook writes a new row carrying a full CLOB copy of the object source, and the CLOB is where virtually all of the segment size lives. The `CORE_LOCKS_PURGE` job (daily, 03:00) applies the retention rule: the last 7 days stay untouched as a working source backup; beyond that, each unique object keeps exactly one row — its newest, with the hash but without the payload — and the rest of the history is deleted. Live locks are never touched. The trade-off is deliberate: after 7 days you lose the old source text and the per-compile history, but you keep who last touched each object, when, and its source fingerprint.
+
+Freed space is reused by new rows, so the segment stops growing but does not shrink on its own. To hand space back to the tablespace after the first purge of a large backlog, run once:
+
+```sql
+ALTER TABLE core_locks ENABLE ROW MOVEMENT;
+ALTER TABLE core_locks SHRINK SPACE CASCADE;
+ALTER TABLE core_locks DISABLE ROW MOVEMENT;
+```

@@ -59,6 +59,15 @@ CREATE OR REPLACE PACKAGE core_lock AS
 
 
 
+    --
+    -- Retention rule for the lock history, run daily by the CORE_LOCKS_PURGE job:
+    -- rows younger than g_purge_after days stay untouched; beyond that each unique
+    -- object collapses to its newest row, which keeps the hash but drops the payload
+    --
+    PROCEDURE purge_locks;
+
+
+
     FUNCTION get_object
     RETURN CLOB;
 

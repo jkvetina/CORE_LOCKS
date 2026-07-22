@@ -3,6 +3,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
     g_lock_length       CONSTANT NUMBER     := 20/1440;     -- for how long is lock valid
     g_lock_rebook       CONSTANT NUMBER     := 10/1440;     -- how long to create a new lock (object backup)
     g_check_hash        CONSTANT BOOLEAN    := TRUE;
+    g_purge_after       CONSTANT NUMBER     := 7;           -- how many days of history the purge job keeps untouched
 
 
 
@@ -280,6 +281,59 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         END LOOP;
         --
         COMMIT;
+        --
+    EXCEPTION
+    WHEN app_exception THEN
+        ROLLBACK;
+        RAISE;
+    WHEN OTHERS THEN
+        ROLLBACK;
+        raise_error();
+    END;
+
+
+
+    --
+    -- Retention rule for the lock history, run daily by the CORE_LOCKS_PURGE job:
+    -- rows younger than g_purge_after days stay untouched; beyond that each unique
+    -- object collapses to its newest row, which keeps the hash but drops the payload
+    --
+    PROCEDURE purge_locks
+    AS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        --
+        v_deleted           PLS_INTEGER;
+        v_stripped          PLS_INTEGER;
+    BEGIN
+        -- delete old history rows, the newest row per object survives as the hash carrier
+        DELETE FROM core_locks t
+        WHERE 1 = 1
+            AND t.locked_at     < TRUNC(SYSDATE) - g_purge_after
+            AND (t.expire_at    < SYSDATE OR t.expire_at IS NULL)
+            AND t.lock_id NOT IN (
+                SELECT MAX(s.lock_id)
+                FROM core_locks s
+                GROUP BY
+                    s.object_owner,
+                    s.object_type,
+                    s.object_name
+            );
+        --
+        v_deleted := SQL%ROWCOUNT;
+
+        -- ditch the payload on the kept old rows, the hash stays for takeover checks
+        UPDATE core_locks t
+        SET t.object_payload    = NULL
+        WHERE 1 = 1
+            AND t.locked_at     < TRUNC(SYSDATE) - g_purge_after
+            AND (t.expire_at    < SYSDATE OR t.expire_at IS NULL)
+            AND t.object_payload IS NOT NULL;
+        --
+        v_stripped := SQL%ROWCOUNT;
+        --
+        COMMIT;
+        --
+        DBMS_OUTPUT.PUT_LINE('CORE_LOCKS_PURGE: ROWS_DELETED=' || v_deleted || ' PAYLOADS_DITCHED=' || v_stripped);
         --
     EXCEPTION
     WHEN app_exception THEN
