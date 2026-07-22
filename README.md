@@ -48,7 +48,7 @@ GRANT EXECUTE ON dbms_scheduler TO <schema>;   -- the locksmith enable job
 
 `APEX_STRING` must be reachable — `get_object` uses `APEX_STRING.SPLIT_CLOBS` to normalize the captured DDL. `DBMS_OUTPUT` is used by `unlock` for feedback.
 
-Every developer must reach the schema under an identifiable name. `core_lock.get_user` resolves, in order, the proxy user, then `CLIENT_IDENTIFIER`, then `CLIENT_INFO`. If all three are empty, `create_lock` raises `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID` and the DDL fails — generic shared logins are rejected by design, since a lock owned by "the schema account" tells you nothing.
+Every developer must reach the schema under an identifiable name: either connect through a proxy user or set `CLIENT_IDENTIFIER` (`DBMS_SESSION.SET_IDENTIFIER`). The `core_locksmith` trigger refuses tracked DDL from a session that has neither — `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID` — so the compile fails. Generic shared logins are rejected by design, since a lock owned by "the schema account" tells you nothing. For the lock owner's name, `core_lock.get_user` resolves, in order, the proxy user, then `CLIENT_IDENTIFIER`, then `CLIENT_INFO`.
 
 ---
 
@@ -70,7 +70,7 @@ The job is optional but recommended; see [Operational Notes](#7-operational-note
 
 ## 4. How It Works
 
-`core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it calls `core_lock.create_lock`.
+`core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it first refuses the statement outright when the session has neither a proxy user nor a `CLIENT_IDENTIFIER` set — no anonymous compiles — and then calls `core_lock.create_lock`.
 
 `create_lock` captures the statement's own text through `ora_sql_txt`, normalizes the first and last line so the same source compiled by different clients hashes identically, and skips `ALTER ... COMPILE` entirely — recompiling is not a change. Source-bearing object types are hashed with SHA-256.
 

@@ -1,20 +1,10 @@
 CREATE OR REPLACE TRIGGER core_locksmith
 AFTER DDL ON SCHEMA
-DECLARE
-    rec             core_locks%ROWTYPE;
 BEGIN
     -- ignore procedure scanning objects
     IF ORA_DICT_OBJ_TYPE = 'PROCEDURE' AND ORA_DICT_OBJ_NAME LIKE 'DEPSCAN$%' THEN
         RETURN;
     END IF;
-
-    -- get username, but we dont want generic users
-    BEGIN
-        rec.locked_by := core_lock.get_user();
-    EXCEPTION
-    WHEN OTHERS THEN
-        NULL;
-    END;
 
     -- evaluate only specific events and specific object types
     IF ORA_SYSEVENT IN ('CREATE', 'ALTER', 'DROP')
@@ -24,11 +14,21 @@ BEGIN
         )
         AND ORA_DICT_OBJ_NAME NOT LIKE 'CORE_LOCK%'
     THEN
+        -- refuse anonymous sessions, we dont want generic users
+        -- either connect through a proxy user or set the client identifier
+        IF COALESCE (
+                NULLIF(SYS_CONTEXT('USERENV', 'PROXY_USER'), 'ORDS_PUBLIC_USER'),
+                SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER')
+            ) IS NULL
+        THEN
+            core_lock.raise_error('USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID');
+        END IF;
+        --
         core_lock.create_lock (
             in_object_owner     => ORA_DICT_OBJ_OWNER,
             in_object_type      => ORA_DICT_OBJ_TYPE,
             in_object_name      => ORA_DICT_OBJ_NAME,
-            in_locked_by        => rec.locked_by,
+            in_locked_by        => NULL,
             in_expire_at        => NULL
         );
     END IF;
@@ -40,4 +40,3 @@ WHEN OTHERS THEN
     core_lock.raise_error();
 END;
 /
-
