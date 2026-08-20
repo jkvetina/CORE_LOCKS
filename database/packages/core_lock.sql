@@ -29,13 +29,31 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
     FUNCTION get_user
     RETURN core_locks.locked_by%TYPE
     AS
+        v_client_id         core_locks.locked_by%TYPE;
+        v_client_info       core_locks.locked_by%TYPE;
     BEGIN
+        -- APEX stamps the identifier as JAN:12345678, so drop the session number
+        v_client_id         := TRIM(REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER'), ':\d+$', ''));
+        v_client_info       := TRIM(REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_INFO'), '^[^:]+:', ''));
+
+        -- a number is no name at all, some clients (Toad) stamp the session with one,
+        -- and a lock owned by 1234 tells you as little as one owned by the schema
+        IF REGEXP_LIKE(v_client_id, '^\d+$') THEN
+            v_client_id := NULL;
+        END IF;
+        --
+        IF REGEXP_LIKE(v_client_info, '^\d+$') THEN
+            v_client_info := NULL;
+        END IF;
+
         -- get username, proxy first, then SQL Workshop, APEX...
         -- not adding schema on purpose, we dont want generic users
+        -- the IP is the last resort, not a person but still something you can trace
         RETURN COALESCE (
             NULLIF(SYS_CONTEXT('USERENV', 'PROXY_USER'), 'ORDS_PUBLIC_USER'),
-            REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER'), ':\d+$', ''),
-            REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_INFO'), '^[^:]+:', '')
+            v_client_id,
+            v_client_info,
+            SYS_CONTEXT('USERENV', 'IP_ADDRESS')
         );
     END;
 

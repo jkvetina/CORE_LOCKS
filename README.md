@@ -49,7 +49,7 @@ GRANT EXECUTE ON dbms_scheduler TO <schema>;   -- the locksmith enable job
 
 `APEX_STRING` must be reachable; `get_object` uses `APEX_STRING.SPLIT_CLOBS` to normalize the captured DDL. `DBMS_OUTPUT` is used by `unlock` for feedback.
 
-Every developer must reach the schema under an identifiable name, because the `core_locksmith` trigger refuses anonymous DDL. Setting this up has its own section: [Proxy Users & Startup Script](#4-proxy-users--startup-script).
+Every developer should reach the schema under an identifiable name, because a lock is only useful when you know who to call about it. Sessions that offer no name fall back to their IP address, and the `core_locksmith` trigger refuses the DDL when there is not even that. Setting this up has its own section: [Proxy Users & Startup Script](#4-proxy-users--startup-script).
 
 ---
 
@@ -72,9 +72,9 @@ Both jobs are optional but recommended; see [Operational Notes](#8-operational-n
 
 ## 4. Proxy Users & Startup Script
 
-A lock is only as good as the name on it, so the `core_locksmith` trigger refuses tracked DDL from any session it cannot put a name to. The compile fails with `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID`. Generic shared logins are rejected by design; a lock owned by "the schema account" tells you nothing about who to call.
+A lock is only as good as the name on it. Generic shared logins are rejected by design; a lock owned by "the schema account" tells you nothing about who to call. A session that offers no name gets its IP address instead, and one that cannot offer even that is refused with `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID` (see [The IP fallback](#the-ip-fallback)).
 
-There are two ways to give a session a name. Pick one for the whole team.
+There are two ways to give a session a real name. Pick one for the whole team.
 
 ### Proxy users (recommended)
 
@@ -114,7 +114,7 @@ END;
 /
 ```
 
-The catch: `CLIENT_IDENTIFIER` lives only as long as the session. Reconnect and it is gone, and your next compile fails with the `USER_ERROR` above. So don't run it by hand; wire it into your tool so it fires on every connect:
+The catch: `CLIENT_IDENTIFIER` lives only as long as the session. Reconnect and it is gone, and your next lock row carries a bare IP address instead of your name. So don't run it by hand; wire it into your tool so it fires on every connect:
 
 - **SQL Developer** – Tools > Preferences > Database > "Filename for connection startup script", pointed at a file containing the block above.
 - **SQLcl and SQL\*Plus** – put the block into `login.sql`, which runs after every `CONNECT`. Since 12.2, SQL\*Plus reads it only from `SQLPATH`/`ORACLE_PATH`, not from the current directory.
@@ -122,21 +122,36 @@ The catch: `CLIENT_IDENTIFIER` lives only as long as the session. Reconnect and 
 
 Compiles from APEX need no setup at all. SQL Workshop and the Object Browser both work, so editing a package in the browser and saving it is tracked like any other DDL. APEX stamps the session with the Builder user who is logged in, in the shape `JAN:12345678`, and `get_user` drops the trailing session number, so the lock row carries the Builder username on its own.
 
+### The IP fallback
+
+Not every tool leaves a name behind. Some set nothing at all, and some (Toad likes doing this) stamp `CLIENT_IDENTIFIER` with a plain number, which looks like an identity but names nobody. So a value made of digits only is thrown away, and the session falls back to its IP address:
+
+```
+LOCK_TIME_ERROR: OBJECT_LOCKED_BY `10.20.30.44` [10231]
+```
+
+Not a person, but still something you can trace, and the lock keeps doing its actual job of stopping two people from compiling the same package. Two things to know about it:
+
+- Developers sharing one machine share one lock owner. On a Citrix farm or behind a NAT everyone arrives from the same address, so the feature cannot tell them apart.
+- A local connection on the database server has no IP at all, and neither does a scheduler job, so those are still refused with `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID`.
+
+Treat the fallback as a safety net for the tool you cannot configure, not as a replacement for a proxy user.
+
 ### Verify
 
 ```sql
 SELECT core_lock.get_user() FROM dual;
 ```
 
-NULL means your next compile will fail. Anything else is exactly the name your colleagues will see in `OBJECT_LOCKED_BY` errors, so keep it consistent across tools – `JAN` in SQL Developer and `JKVETINA` in SQLcl count as two different people.
+NULL means your next compile will fail. An IP address means nothing named your session and the fallback took over, so go back and wire one of the two options above. Anything else is exactly the name your colleagues will see in `OBJECT_LOCKED_BY` errors, so keep it consistent across tools – `JAN` in SQL Developer and `JKVETINA` in SQLcl count as two different people.
 
-`get_user` resolves the name in this order: proxy user first, then `CLIENT_IDENTIFIER`, then `CLIENT_INFO`.
+`get_user` resolves the name in this order: proxy user first, then `CLIENT_IDENTIFIER`, then `CLIENT_INFO`, then the session IP address. A `CLIENT_IDENTIFIER` or `CLIENT_INFO` holding nothing but digits is dropped on the way.
 
 ---
 
 ## 5. How It Works
 
-`core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it first refuses the statement outright when the session has neither a proxy user nor a `CLIENT_IDENTIFIER` set (no anonymous compiles, see [Proxy Users & Startup Script](#4-proxy-users--startup-script)), and then calls `core_lock.create_lock`.
+`core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it first refuses the statement outright when `core_lock.get_user()` comes back NULL, which after the IP fallback means a session with no proxy user, no usable identifier and no IP address (see [The IP fallback](#the-ip-fallback)), and then calls `core_lock.create_lock`.
 
 `create_lock` captures the statement's own text through `ora_sql_txt`, normalizes the first and last line so the same source compiled by different clients hashes identically, and skips `ALTER ... COMPILE` entirely – recompiling is not a change. Source-bearing object types are hashed with SHA-256.
 
@@ -231,7 +246,7 @@ Lock numbering starts at 10000, assigned by the identity column on `core_locks.l
 
 ## 8. Operational Notes
 
-**This trigger can block every DDL in the schema.** It is `AFTER DDL ON SCHEMA` and it raises. A bug in `core_lock`, a missing `DBMS_CRYPTO` grant, or a developer connecting without an identifiable username will fail *all* DDL, including the DDL needed to fix the package. Install it on a dev schema first and understand the escape hatch before putting it anywhere that matters.
+**This trigger can block every DDL in the schema.** It is `AFTER DDL ON SCHEMA` and it raises. A bug in `core_lock`, a missing `DBMS_CRYPTO` grant, or a session with neither a name nor an IP address will fail *all* DDL, including the DDL needed to fix the package. Install it on a dev schema first and understand the escape hatch before putting it anywhere that matters.
 
 **The escape hatch is not just disabling the trigger.** `CORE_LOCKSMITH_ENABLE` is a scheduler job that runs `ALTER TRIGGER CORE_LOCKSMITH ENABLE` every five minutes. That is the point – it stops the trigger from being quietly switched off and left off. But it also means this is not enough:
 

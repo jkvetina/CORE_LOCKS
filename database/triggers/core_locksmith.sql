@@ -16,11 +16,8 @@ BEGIN
     THEN
         -- refuse anonymous sessions, we dont want generic users
         -- either connect through a proxy user or set the client identifier
-        IF COALESCE (
-                NULLIF(SYS_CONTEXT('USERENV', 'PROXY_USER'), 'ORDS_PUBLIC_USER'),
-                SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER')
-            ) IS NULL
-        THEN
+        -- get_user falls back to the IP, so this only fires on a local connection
+        IF core_lock.get_user() IS NULL THEN
             core_lock.raise_error('USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID');
         END IF;
         --

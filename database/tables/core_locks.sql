@@ -21,7 +21,7 @@ COMMENT ON COLUMN core_locks.lock_id            IS 'Identity column, numbering f
 COMMENT ON COLUMN core_locks.object_owner       IS 'ORA_DICT_OBJ_OWNER of the DDL event.';
 COMMENT ON COLUMN core_locks.object_type        IS 'ORA_DICT_OBJ_TYPE. Only PACKAGE, PACKAGE BODY, PROCEDURE, FUNCTION, TRIGGER and VIEW get a hash.';
 COMMENT ON COLUMN core_locks.object_name        IS 'ORA_DICT_OBJ_NAME. CORE_LOCK% objects are never recorded, so the feature cannot lock itself out.';
-COMMENT ON COLUMN core_locks.locked_by          IS 'Lock owner, from get_user(): proxy user, else CLIENT_IDENTIFIER, else CLIENT_INFO. Never the schema account.';
+COMMENT ON COLUMN core_locks.locked_by          IS 'Lock owner, from get_user(): proxy user, else CLIENT_IDENTIFIER, else CLIENT_INFO, else the session IP. A purely numeric identifier is dropped, some clients stamp one. Never the schema account.';
 COMMENT ON COLUMN core_locks.locked_at          IS 'When this row was cut. Rebook anchor: a compile later than locked_at + g_lock_rebook closes this row and starts a new one.';
 COMMENT ON COLUMN core_locks.expire_at          IS 'Lock is live until this time. NULL means released by unlock, a past value means expired; both let another user take the object.';
 COMMENT ON COLUMN core_locks.counter            IS 'How many times extend_lock refreshed this row, i.e. compiles inside the rebook window. 1 at insert.';
