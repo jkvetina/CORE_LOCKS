@@ -120,7 +120,7 @@ The catch: `CLIENT_IDENTIFIER` lives only as long as the session. Reconnect and 
 - **SQLcl and SQL\*Plus** – put the block into `login.sql`, which runs after every `CONNECT`. Since 12.2, SQL\*Plus reads it only from `SQLPATH`/`ORACLE_PATH`, not from the current directory.
 - **Other tools** – look for a logon or post-connect script hook; most IDEs have one.
 
-Compiles from APEX SQL Workshop need no setup at all; APEX already stamps the session with the APEX username and `get_user` picks it up.
+Compiles from APEX need no setup at all. SQL Workshop and the Object Browser both work, so editing a package in the browser and saving it is tracked like any other DDL. APEX stamps the session with the Builder user who is logged in, in the shape `JAN:12345678`, and `get_user` drops the trailing session number, so the lock row carries the Builder username on its own.
 
 ### Verify
 
