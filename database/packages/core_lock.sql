@@ -5,6 +5,10 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
     g_check_hash        CONSTANT BOOLEAN    := TRUE;
     g_purge_after       CONSTANT NUMBER     := 7;           -- how many days of history the purge job keeps untouched
 
+    -- accounts that name a connection pool or a process, never a person
+    -- colon delimited on both ends, so INSTR matches a whole name and not a fragment
+    c_anon_users        CONSTANT VARCHAR2(256) := ':ORDS_PUBLIC_USER:APEX_PUBLIC_USER:APEX_REST_PUBLIC_USER:ANONYMOUS:NOBODY:ORACLE:ROOT:SYSTEM:';
+
 
 
     PROCEDURE raise_error (
@@ -26,33 +30,124 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
 
-    FUNCTION get_user
+    FUNCTION clean_user (
+        in_name             VARCHAR2
+    )
     RETURN core_locks.locked_by%TYPE
     AS
-        v_client_id         core_locks.locked_by%TYPE;
-        v_client_info       core_locks.locked_by%TYPE;
+        v_name              core_locks.locked_by%TYPE;
     BEGIN
-        -- APEX stamps the identifier as JAN:12345678, so drop the session number
-        v_client_id         := TRIM(REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER'), ':\d+$', ''));
-        v_client_info       := TRIM(REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_INFO'), '^[^:]+:', ''));
+        -- the client identifier is a key, not a name, and every tool builds it its own way,
+        -- APEX stamps JAN:12345678 and a session context manager can stamp JAN_100_12345678901234,
+        -- so drop the trailing session number in both shapes
+        v_name := TRIM(REGEXP_REPLACE(in_name, '(:\d+|_\d+_\d+)$', ''));
 
         -- a number is no name at all, some clients (Toad) stamp the session with one,
         -- and a lock owned by 1234 tells you as little as one owned by the schema
-        IF REGEXP_LIKE(v_client_id, '^\d+$') THEN
-            v_client_id := NULL;
-        END IF;
-        --
-        IF REGEXP_LIKE(v_client_info, '^\d+$') THEN
-            v_client_info := NULL;
+        IF REGEXP_LIKE(v_name, '^\d+$') THEN
+            RETURN NULL;
         END IF;
 
-        -- get username, proxy first, then SQL Workshop, APEX...
+        -- a pool or process account is not a person either
+        IF INSTR(c_anon_users, ':' || UPPER(v_name) || ':') > 0 THEN
+            RETURN NULL;
+        END IF;
+
+        -- one case for everybody. Jan, JAN and jan are one developer, and the lock
+        -- compares owners as strings, so letting the case through would let the same
+        -- person lock themselves out from a tool that capitalizes differently
+        RETURN UPPER(v_name);
+    END;
+
+
+
+    FUNCTION recover_user
+    RETURN core_locks.locked_by%TYPE
+    AS
+        v_trail             core_locks.audit_trail%TYPE := get_audit_trail();
+        v_place             core_locks.audit_trail%TYPE;
+        v_name              core_locks.locked_by%TYPE;
+    BEGIN
+        IF v_trail IS NULL THEN
+            RETURN NULL;
+        END IF;
+
+        -- the session cannot say who it belongs to, but the workstation can,
+        -- so ask the history what this exact machine and tool called itself last time
+        -- KEEP DENSE_RANK LAST gives the newest row and NULL when there is none,
+        -- which is what we want here, an empty history is not an error
+        SELECT MAX(t.locked_by) KEEP (DENSE_RANK LAST ORDER BY t.lock_id)
+        INTO v_name
+        FROM core_locks t
+        WHERE t.audit_trail     = v_trail
+            AND REGEXP_LIKE(t.locked_by, '[A-Za-z]')
+            AND NOT REGEXP_LIKE(t.locked_by, '^\d{1,3}(\.\d{1,3}){3}$');
+        --
+        IF v_name IS NOT NULL THEN
+            RETURN UPPER(v_name);
+        END IF;
+
+        -- same desk, different tool: the trail carries the module in its tail, so
+        -- widen the question to the address and the host and ask again
+        v_place := REGEXP_SUBSTR(v_trail, '^[^|]*\|[^|]*');
+        --
+        SELECT MAX(t.locked_by) KEEP (DENSE_RANK LAST ORDER BY t.lock_id)
+        INTO v_name
+        FROM core_locks t
+        WHERE REGEXP_SUBSTR(t.audit_trail, '^[^|]*\|[^|]*') = v_place
+            AND REGEXP_LIKE(t.locked_by, '[A-Za-z]')
+            AND NOT REGEXP_LIKE(t.locked_by, '^\d{1,3}(\.\d{1,3}){3}$');
+        --
+        RETURN UPPER(v_name);
+    END;
+
+
+
+    FUNCTION get_user
+    RETURN core_locks.locked_by%TYPE
+    AS
+        v_ident             core_locks.locked_by%TYPE := SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER');
+        v_told              core_locks.locked_by%TYPE;
+        v_lost              core_locks.locked_by%TYPE;
+    BEGIN
+        -- a bare name, or APEX's own NAME:12345678, is the session saying who it is,
+        -- and a startup script setting the developer's own name is the best answer there is
+        -- short of a proxy user. A NAME_100_12345678901234 key is something else entirely:
+        -- a context manager overwrote that startup script, and the name left inside the key
+        -- is the application user, which for an SSO login is a company account and not the
+        -- name the developer works under
+        IF REGEXP_LIKE(v_ident, '_\d+_\d+$') THEN
+            -- a key in place of a name means a name was there and got overwritten,
+            -- and that is the only case the history is allowed to answer. A session
+            -- that never carried a name has nothing to recover, and naming it after
+            -- whoever sat at that machine last would be a guess dressed as a fact
+            v_lost := recover_user();
+        ELSE
+            v_told := clean_user(v_ident);
+        END IF;
+
+        -- best source first
+        --   proxy user      the database authenticated the person, nothing beats that
+        --   identifier      the session said who it is, and nothing overwrote it
+        --   recovered       who this same workstation compiled as last time, and only
+        --                   when a context key proves the session did have a name
+        --   APEX user       the application user behind the session, a company account
+        --                   under SSO, so it ranks below the workstation's own memory
+        --   key remains     the name inside a context key, better than nothing
+        --   client info     the same idea, minus the prefix some jobs put in front of it
+        --   OS user         nobody vouched for it and it is often the company account
+        --                   rather than the developer name, but it only gets asked when
+        --                   every other source came back empty, and a name beats an address
         -- not adding schema on purpose, we dont want generic users
         -- the IP is the last resort, not a person but still something you can trace
         RETURN COALESCE (
-            NULLIF(SYS_CONTEXT('USERENV', 'PROXY_USER'), 'ORDS_PUBLIC_USER'),
-            v_client_id,
-            v_client_info,
+            clean_user(SYS_CONTEXT('USERENV', 'PROXY_USER')),
+            v_told,
+            v_lost,
+            clean_user(SYS_CONTEXT('APEX$SESSION', 'APP_USER')),
+            clean_user(v_ident),
+            clean_user(REGEXP_REPLACE(SYS_CONTEXT('USERENV', 'CLIENT_INFO'), '^[^:]+:', '')),
+            clean_user(SYS_CONTEXT('USERENV', 'OS_USER')),
             SYS_CONTEXT('USERENV', 'IP_ADDRESS')
         );
     END;

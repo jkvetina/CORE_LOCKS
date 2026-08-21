@@ -15,6 +15,26 @@ CREATE OR REPLACE PACKAGE core_lock AS
 
 
 
+    --
+    -- Reduce whatever a session carries to a person, NULL when it names nobody.
+    -- Public so the same rule can clean historical core_locks.locked_by values.
+    --
+    FUNCTION clean_user (
+        in_name             VARCHAR2
+    )
+    RETURN core_locks.locked_by%TYPE;
+
+
+
+    --
+    -- Ask the lock history who compiled from this same workstation last time.
+    -- Used when the session carries no name of its own, NULL when nothing matches.
+    --
+    FUNCTION recover_user
+    RETURN core_locks.locked_by%TYPE;
+
+
+
     FUNCTION get_user
     RETURN core_locks.locked_by%TYPE;
 
