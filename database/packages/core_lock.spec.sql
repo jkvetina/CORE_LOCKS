@@ -88,7 +88,16 @@ CREATE OR REPLACE PACKAGE core_lock AS
 
 
 
-    FUNCTION get_object
+    --
+    -- The object source as a lock row stores it. Inside the DDL trigger that is the
+    -- statement itself; called by hand there is no statement to read, so the source
+    -- comes from the dictionary instead and a lock taken outside a compile still
+    -- carries a real backup. Both arguments are needed for that fallback
+    --
+    FUNCTION get_object (
+        in_object_type      core_locks.object_type%TYPE     := NULL,
+        in_object_name      core_locks.object_name%TYPE     := NULL
+    )
     RETURN CLOB;
 
 
