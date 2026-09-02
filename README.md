@@ -250,7 +250,7 @@ All procedures run as autonomous transactions and commit on their own – they m
 
 ### Create lock
 
-`create_lock` is called by the trigger; rarely called by hand.
+`create_lock` is what the trigger calls on every compile, and it takes a lock by hand just as well, to hold an object you are about to deploy over or to book one before you start editing it.
 
 ```sql
 core_lock.create_lock (
@@ -262,6 +262,10 @@ core_lock.create_lock (
     in_hash_check       => TRUE
 );
 ```
+
+Called by hand there is no DDL statement to copy, so the source backup and its hash come from `DBMS_METADATA.GET_DDL` instead. That needs no grant for your own objects and covers every type in one call, which `user_views.text` and `user_triggers.trigger_body` cannot: both are LONG columns, and no SQL expression may concatenate one. An object the dictionary has nothing for is still locked, just without a backup.
+
+One thing to know about the hash when you mix the two. The trigger stores the statement a developer compiled; a lock taken by hand stores what `GET_DDL` prints, and the two are not the same text. Measured on Oracle 26ai for one package body: 101 characters from the trigger, 128 from the dictionary, and two different hashes. So the next compile inside the one-minute takeover window can read as `LOCK_HASH_ERROR` when nothing changed. Compile the object once, unchanged, and the row is right again, which is what the hash check asks you to do anyway.
 
 ### Unlock
 
@@ -298,7 +302,7 @@ core_lock.purge_locks();
 
 ### Helpers
 
-`get_user`, `clean_user`, `recover_user`, `get_audit_trail`, `get_object`, and `get_clob_hash` are exposed for diagnostics. Note that `get_object` reads `ora_sql_txt` and therefore returns meaningful output **only inside a DDL trigger** – called standalone it returns nothing useful.
+`get_user`, `clean_user`, `recover_user`, `get_audit_trail`, `get_object`, and `get_clob_hash` are exposed for diagnostics. `get_object` reads the DDL statement through `ora_sql_txt` inside a trigger; called by hand it falls back to the dictionary, so pass it the type and the name (`core_lock.get_object('PACKAGE BODY', 'MY_PACKAGE')`) or it has nothing to look up.
 
 `clean_user` strips the trailing session number, drops anything that names no person, and uppercases what is left. It is public for one practical reason: it is the same rule the lock rows were written with, so you can point it at history you inherited from an older install and see who the owners really were.
 

@@ -9,6 +9,18 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
     -- colon delimited on both ends, so INSTR matches a whole name and not a fragment
     c_anon_users        CONSTANT VARCHAR2(256) := ':ORDS_PUBLIC_USER:APEX_PUBLIC_USER:APEX_REST_PUBLIC_USER:ANONYMOUS:NOBODY:ORACLE:ROOT:SYSTEM:';
 
+    -- set by get_object when the statement it read was an ALTER ... COMPILE, the one
+    -- empty payload that means "not a change" rather than "no statement to read"
+    g_alter_compile     BOOLEAN := FALSE;
+
+
+
+    FUNCTION dict_object (
+        in_object_type      core_locks.object_type%TYPE,
+        in_object_name      core_locks.object_name%TYPE
+    )
+    RETURN CLOB;
+
 
 
     PROCEDURE raise_error (
@@ -186,10 +198,15 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
             raise_error('USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID');
         END IF;
 
-        -- get current object
-        rec.object_payload := get_object();
+        -- get current object, from the statement in the trigger and from the
+        -- dictionary when this is called by hand
+        rec.object_payload := get_object(in_object_type, in_object_name);
         --
-        IF rec.object_payload IS NULL THEN
+        -- an ALTER ... COMPILE is the one empty payload that means "not a change",
+        -- so it is the only one that opens no lock. Anything else locks with the
+        -- payload it has, NULL included: a TABLE carries no source and a lock taken
+        -- outside a compile is still a lock
+        IF g_alter_compile THEN
             RETURN;
         END IF;
 
@@ -275,6 +292,33 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
 
+    --
+    -- The object a lock row is about, re-read for an extend. The row knows the type
+    -- and the name, so an extend called by hand refreshes the backup exactly like
+    -- one driven from the trigger instead of reading an empty statement
+    --
+    FUNCTION lock_source (
+        in_lock_id          core_locks.lock_id%TYPE
+    )
+    RETURN CLOB
+    AS
+        v_out           CLOB;
+    BEGIN
+        FOR c IN (
+            SELECT
+                t.object_type,
+                t.object_name
+            FROM core_locks t
+            WHERE t.lock_id     = in_lock_id
+        ) LOOP
+            v_out := get_object(c.object_type, c.object_name);
+        END LOOP;
+        --
+        RETURN v_out;
+    END;
+
+
+
     PROCEDURE extend_lock (
         in_lock_id          core_locks.lock_id%TYPE,
         in_time             NUMBER
@@ -285,13 +329,13 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         rec                 core_locks%ROWTYPE;
     BEGIN
         rec.expire_at       := SYSDATE + NVL(in_time, g_lock_length);
-        rec.object_payload  := get_object();
+        rec.object_payload  := lock_source(in_lock_id);
         rec.object_hash     := get_clob_hash(rec.object_payload);
         --
         UPDATE core_locks t
         SET t.counter           = NVL(t.counter, 0) + 1,
             t.expire_at         = rec.expire_at,
-            t.object_payload    = rec.object_payload,
+            t.object_payload    = NVL(rec.object_payload, t.object_payload),
             t.object_hash       = NVL(rec.object_hash, t.object_hash)
         WHERE t.lock_id         = in_lock_id;
         --
@@ -318,13 +362,13 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         rec                 core_locks%ROWTYPE;
     BEGIN
         rec.expire_at       := NVL(in_expire_at, SYSDATE + g_lock_length);
-        rec.object_payload  := get_object();
+        rec.object_payload  := lock_source(in_lock_id);
         rec.object_hash     := get_clob_hash(rec.object_payload);
         --
         UPDATE core_locks t
         SET t.counter           = NVL(t.counter, 0) + 1,
             t.expire_at         = rec.expire_at,
-            t.object_payload    = rec.object_payload,
+            t.object_payload    = NVL(rec.object_payload, t.object_payload),
             t.object_hash       = NVL(rec.object_hash, t.object_hash)
         WHERE t.lock_id         = in_lock_id;
         --
@@ -459,7 +503,34 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
 
-    FUNCTION get_object
+    --
+    -- The object as the dictionary holds it, for a lock taken outside the DDL trigger
+    -- where there is no statement to read. DBMS_METADATA covers every type in one
+    -- call and returns a CLOB, which user_views.text and user_triggers.trigger_body
+    -- cannot: both are LONG and no SQL expression may concatenate one. It needs no
+    -- grant for the caller's own objects, and an object that is not there raises
+    -- ORA-31603, which answers NULL and locks without a backup
+    --
+    FUNCTION dict_object (
+        in_object_type      core_locks.object_type%TYPE,
+        in_object_name      core_locks.object_name%TYPE
+    )
+    RETURN CLOB
+    AS
+    BEGIN
+        -- the metadata API spells a two-word type with an underscore
+        RETURN DBMS_METADATA.GET_DDL(REPLACE(in_object_type, ' ', '_'), in_object_name);
+    EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+    END;
+
+
+
+    FUNCTION get_object (
+        in_object_type      core_locks.object_type%TYPE     := NULL,
+        in_object_name      core_locks.object_name%TYPE     := NULL
+    )
     RETURN CLOB
     AS
         v_sql_text      ora_name_list_t;            -- TABLE OF VARCHAR2(64);
@@ -468,10 +539,24 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         v_rows          PLS_INTEGER;
         v_alter         BOOLEAN := FALSE;
     BEGIN
-        -- get object source into a CLOB
-        FOR i IN 1 .. ora_sql_txt(v_sql_text) LOOP
-            v_temp := v_temp || TO_CLOB(v_sql_text(i));
-        END LOOP;
+        g_alter_compile := FALSE;
+
+        -- get object source into a CLOB. ora_sql_txt carries a statement only inside
+        -- a DDL trigger and raises anywhere else, which is what stopped create_lock
+        -- from being callable by hand
+        BEGIN
+            FOR i IN 1 .. ora_sql_txt(v_sql_text) LOOP
+                v_temp := v_temp || TO_CLOB(v_sql_text(i));
+            END LOOP;
+        EXCEPTION
+        WHEN OTHERS THEN
+            v_temp := NULL;
+        END;
+
+        -- no statement means this was called by hand, so ask the dictionary instead
+        IF v_temp IS NULL AND in_object_name IS NOT NULL THEN
+            v_temp := dict_object(in_object_type, in_object_name);
+        END IF;
 
         -- tweak the CLOB slightly so it matches for different clients
         FOR c IN (
@@ -509,6 +594,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         END LOOP;
         --
         IF v_alter AND INSTR(UPPER(v_out), 'COMPILE') > 0 THEN
+            g_alter_compile := TRUE;
             RETURN NULL;
         END IF;
         --
