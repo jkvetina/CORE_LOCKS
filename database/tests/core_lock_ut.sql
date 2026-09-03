@@ -82,6 +82,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
     AS
     BEGIN
         core_lock_fixture.act_as(core_lock_fixture.c_alice);
+
+        -- get_user reads client info as one of its fallbacks and one test sets it.
+        -- It survives a commit and belongs to the session, not to the transaction,
+        -- so a leftover would answer for a later test that meant to ask the OS
+        DBMS_APPLICATION_INFO.SET_CLIENT_INFO(NULL);
+        --
         core_lock_fixture.clear_locks();
     END;
 
@@ -186,6 +192,45 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
 
 
 
+    PROCEDURE test_get_user#a_context_key_asks_the_history
+    AS
+    BEGIN
+        -- a key in place of a name means a name was there and a context manager
+        -- wrote over it. The name left inside the key is the application user,
+        -- which under SSO is a company account rather than the developer, so the
+        -- workstation's own memory outranks it
+        core_lock_fixture.act_as('CAROL_100_12345678901234');
+        --
+        INSERT INTO core_locks (
+            object_owner, object_type, object_name, locked_by,
+            locked_at, expire_at, counter, audit_trail
+        )
+        VALUES (
+            USER, 'PROCEDURE', 'CLUT_HISTORY', 'DAVE',
+            SYSDATE, SYSDATE, 1, core_lock.get_audit_trail()
+        );
+        --
+        COMMIT;
+        --
+        -- DAVE is what this machine compiled as; CAROL is what the key still says
+        ut.expect(core_lock.get_user()).to_equal('DAVE');
+    END;
+
+
+
+    PROCEDURE test_get_user#falls_back_to_the_client_info_name
+    AS
+    BEGIN
+        DBMS_SESSION.CLEAR_IDENTIFIER();
+        DBMS_APPLICATION_INFO.SET_CLIENT_INFO('JOB:ERIC');
+        --
+        -- the prefix in front of the colon belongs to the job that set it, and
+        -- the name behind it belongs to the person the lock is about
+        ut.expect(core_lock.get_user()).to_equal('ERIC');
+    END;
+
+
+
     -- -------------------------------------------------------------- recover_user
 
 
@@ -205,6 +250,34 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
         COMMIT;
         --
         ut.expect(core_lock.recover_user()).to_equal('CAROL');
+    END;
+
+
+
+    PROCEDURE test_recover_user#same_desk_different_tool
+    AS
+        -- the same address and host, a different timezone and module, which is
+        -- the same developer opening a second tool at the same desk
+        v_trail             core_locks.audit_trail%TYPE := SUBSTR (
+            REGEXP_SUBSTR(core_lock.get_audit_trail(), '^[^|]*\|[^|]*') || '|OTHER_ZONE|OTHER_TOOL',
+            1, 128
+        );
+    BEGIN
+        INSERT INTO core_locks (
+            object_owner, object_type, object_name, locked_by,
+            locked_at, expire_at, counter, audit_trail
+        )
+        VALUES (
+            USER, 'PROCEDURE', 'CLUT_HISTORY', 'FRANK',
+            SYSDATE, SYSDATE, 1, v_trail
+        );
+        --
+        COMMIT;
+
+        -- said out loud, because the whole test rests on it: the exact trail
+        -- matches nothing, so only the widened question can answer FRANK
+        ut.expect(v_trail).not_to_equal(core_lock.get_audit_trail());
+        ut.expect(core_lock.recover_user()).to_equal('FRANK');
     END;
 
 
@@ -256,6 +329,25 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
 
 
 
+    PROCEDURE test_get_object#reads_a_view_past_the_varchar_limit
+    AS
+        v_src               CLOB;
+    BEGIN
+        core_lock_fixture.compile_probe('BIG VIEW', 1);
+        --
+        v_src := core_lock.get_object('VIEW', core_lock_fixture.c_bigview);
+
+        -- a view's text is a LONG, and a SELECT INTO of one stops at the varchar
+        -- ceiling, so a big reporting view would lose its backup and its
+        -- fingerprint exactly where a lock is worth the most. The last padding
+        -- line is the proof: a read that stopped at the first chunk keeps
+        -- pad000001 and never reaches this one
+        ut.expect(DBMS_LOB.GETLENGTH(v_src)).to_be_greater_than(40000);
+        ut.expect(DBMS_LOB.INSTR(v_src, 'pad001800')).to_be_greater_than(0);
+    END;
+
+
+
     -- -------------------------------------------------------------- get_clob_hash
 
 
@@ -285,6 +377,22 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
         v_other             VARCHAR2(128) := core_lock.get_clob_hash(TO_CLOB('BEGIN RETURN; END;'));
     BEGIN
         ut.expect(v_other).not_to_equal(v_first);
+    END;
+
+
+
+    PROCEDURE test_get_clob_hash#an_explicit_algorithm_is_used
+    AS
+        v_default           VARCHAR2(256) := core_lock.get_clob_hash(TO_CLOB('BEGIN NULL; END;'));
+        v_wider             VARCHAR2(256) := core_lock.get_clob_hash(TO_CLOB('BEGIN NULL; END;'), DBMS_CRYPTO.HASH_SH512);
+    BEGIN
+        -- a 256 bit digest prints 64 hex characters and a 512 bit one prints 128,
+        -- so the length is what says which algorithm actually ran. Comparing the
+        -- two digests instead would pass with the argument thrown away, because a
+        -- default-only implementation returns the same string twice and the
+        -- assertion would be that it did not
+        ut.expect(LENGTH(v_default)).to_equal(64);
+        ut.expect(LENGTH(v_wider)).to_equal(128);
     END;
 
 
@@ -484,6 +592,84 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
 
 
 
+    PROCEDURE test_create_lock#an_explicit_name_owns_the_lock
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+
+        -- the session says Alice and the caller says otherwise, which is how a
+        -- tool books a lock on behalf of somebody it authenticated itself
+        core_lock.create_lock (
+            in_object_owner => USER,
+            in_object_type  => 'PROCEDURE',
+            in_object_name  => core_lock_fixture.c_proc,
+            in_locked_by    => 'DAVE'
+        );
+        --
+        rec := newest_lock(core_lock_fixture.c_proc);
+        --
+        ut.expect(rec.locked_by).to_equal('DAVE');
+    END;
+
+
+
+    PROCEDURE test_create_lock#an_explicit_expiry_is_kept
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        --
+        core_lock.create_lock (
+            in_object_owner => USER,
+            in_object_type  => 'PROCEDURE',
+            in_object_name  => core_lock_fixture.c_proc,
+            in_expire_at    => SYSDATE + 3/1440
+        );
+        --
+        rec := newest_lock(core_lock_fixture.c_proc);
+        --
+        -- the default lock length is twenty minutes, so an expiry inside five
+        -- proves the argument was used and not the constant
+        ut.expect(rec.expire_at).to_be_greater_than(SYSDATE + 2/1440);
+        ut.expect(rec.expire_at).to_be_less_than(SYSDATE + 5/1440);
+    END;
+
+
+
+    PROCEDURE test_create_lock#hash_check_off_allows_the_takeover
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        core_lock.create_lock(USER, 'PROCEDURE', core_lock_fixture.c_proc);
+
+        -- exactly the arrangement that refuses a takeover: the lock has run out,
+        -- it was cut a moment ago, and the object is no longer the object it was
+        -- cut against. The only thing different here is the argument
+        core_lock_fixture.age_lock (
+            in_object_name  => core_lock_fixture.c_proc,
+            in_expire_at    => SYSDATE - 1/1440
+        );
+        --
+        core_lock_fixture.compile_probe('PROCEDURE', 2);
+        --
+        core_lock_fixture.act_as(core_lock_fixture.c_bob);
+        --
+        core_lock.create_lock (
+            in_object_owner => USER,
+            in_object_type  => 'PROCEDURE',
+            in_object_name  => core_lock_fixture.c_proc,
+            in_hash_check   => FALSE
+        );
+        --
+        rec := newest_lock(core_lock_fixture.c_proc);
+        --
+        ut.expect(rec.locked_by).to_equal(core_lock_fixture.c_bob);
+    END;
+
+
+
     -- --------------------------------------------------------------- extend_lock
 
 
@@ -560,6 +746,33 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
 
 
 
+    PROCEDURE test_extend_lock#an_explicit_date_sets_the_expiry
+    AS
+        rec                 core_locks%ROWTYPE;
+        v_after             core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        core_lock.create_lock(USER, 'PROCEDURE', core_lock_fixture.c_proc);
+        --
+        rec := newest_lock(core_lock_fixture.c_proc);
+
+        -- the other overload takes an interval and this one takes the moment
+        -- itself, named rather than positional because that is the only thing
+        -- telling the two of them apart
+        core_lock.extend_lock (
+            in_lock_id      => rec.lock_id,
+            in_expire_at    => SYSDATE + 3/1440
+        );
+        --
+        v_after := newest_lock(core_lock_fixture.c_proc);
+        --
+        ut.expect(v_after.expire_at).to_be_greater_than(SYSDATE + 2/1440);
+        ut.expect(v_after.expire_at).to_be_less_than(SYSDATE + 5/1440);
+        ut.expect(v_after.counter).to_equal(rec.counter + 1);
+    END;
+
+
+
     -- -------------------------------------------------------------------- unlock
 
 
@@ -602,6 +815,49 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
         WHERE t.expire_at >= SYSDATE;
         --
         ut.expect(v_live).to_equal(0);
+    END;
+
+
+
+    PROCEDURE test_unlock#releases_only_the_named_object
+    AS
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        core_lock_fixture.compile_probe('FUNCTION', 1);
+        --
+        core_lock.create_lock(USER, 'PROCEDURE', core_lock_fixture.c_proc);
+        core_lock.create_lock(USER, 'FUNCTION', core_lock_fixture.c_fn);
+        --
+        core_lock.unlock(in_object_name => core_lock_fixture.c_proc);
+
+        -- one developer holding two objects releases one of them and keeps
+        -- working on the other, which is the ordinary case and not an edge one
+        ut.expect(newest_lock(core_lock_fixture.c_proc).expire_at).to_be_null();
+        ut.expect(newest_lock(core_lock_fixture.c_fn).expire_at).to_be_greater_than(SYSDATE);
+    END;
+
+
+
+    PROCEDURE test_unlock#narrows_by_object_type
+    AS
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        core_lock_fixture.compile_probe('FUNCTION', 1);
+        --
+        core_lock.create_lock(USER, 'PROCEDURE', core_lock_fixture.c_proc);
+        core_lock.create_lock(USER, 'FUNCTION', core_lock_fixture.c_fn);
+
+        -- by owner alone this releases everything Alice holds, so the type is
+        -- the only thing leaving the procedure locked. A type on its own is not
+        -- enough of an argument for unlock to run at all, which is why the owner
+        -- is here as well
+        core_lock.unlock (
+            in_locked_by    => core_lock_fixture.c_alice,
+            in_object_type  => 'FUNCTION'
+        );
+        --
+        ut.expect(newest_lock(core_lock_fixture.c_fn).expire_at).to_be_null();
+        ut.expect(newest_lock(core_lock_fixture.c_proc).expire_at).to_be_greater_than(SYSDATE);
     END;
 
 

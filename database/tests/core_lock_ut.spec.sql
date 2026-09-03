@@ -45,10 +45,19 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
     -- %test(a session that offers no identifier still resolves to somebody)
     PROCEDURE test_get_user#a_session_with_no_identifier_still_names_somebody;
 
+    -- %test(a context key over a name sends the question to the history)
+    PROCEDURE test_get_user#a_context_key_asks_the_history;
+
+    -- %test(falls back to the name inside client info, prefix and all)
+    PROCEDURE test_get_user#falls_back_to_the_client_info_name;
+
 
 
     -- %test(reads back the name this workstation last compiled under)
     PROCEDURE test_recover_user#finds_the_name_this_workstation_used_last;
+
+    -- %test(same desk and a different tool still names the developer)
+    PROCEDURE test_recover_user#same_desk_different_tool;
 
 
 
@@ -63,6 +72,9 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
     -- %test(an object the dictionary has not got answers null)
     PROCEDURE test_get_object#an_object_the_dictionary_has_not_got_is_null;
 
+    -- %test(a view longer than a varchar2 is read whole)
+    PROCEDURE test_get_object#reads_a_view_past_the_varchar_limit;
+
 
 
     -- %test(a null payload has no fingerprint)
@@ -73,6 +85,9 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
 
     -- %test(different text fingerprints differently)
     PROCEDURE test_get_clob_hash#different_text_fingerprints_differently;
+
+    -- %test(the algorithm asked for is the algorithm used)
+    PROCEDURE test_get_clob_hash#an_explicit_algorithm_is_used;
 
 
 
@@ -101,6 +116,15 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
     -- %test(a compile past the rebook window closes the row and starts a new one)
     PROCEDURE test_create_lock#past_the_rebook_window_starts_a_new_row;
 
+    -- %test(a name given outright owns the lock instead of the session)
+    PROCEDURE test_create_lock#an_explicit_name_owns_the_lock;
+
+    -- %test(an expiry given outright replaces the default lock length)
+    PROCEDURE test_create_lock#an_explicit_expiry_is_kept;
+
+    -- %test(with the fingerprint check off a changed object is taken over)
+    PROCEDURE test_create_lock#hash_check_off_allows_the_takeover;
+
 
 
     -- %test(refreshes the expiry and counts the compile)
@@ -112,6 +136,9 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
     -- %test(an explicit interval sets the expiry)
     PROCEDURE test_extend_lock#an_explicit_interval_sets_the_expiry;
 
+    -- %test(an explicit date sets the expiry, on the other overload)
+    PROCEDURE test_extend_lock#an_explicit_date_sets_the_expiry;
+
 
 
     -- %test(releases the lock and clears the fingerprint)
@@ -119,6 +146,12 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
 
     -- %test(releases every lock one user holds)
     PROCEDURE test_unlock#releases_every_lock_one_user_holds;
+
+    -- %test(releases the object named and leaves the others held)
+    PROCEDURE test_unlock#releases_only_the_named_object;
+
+    -- %test(a type narrows a release that would otherwise take the lot)
+    PROCEDURE test_unlock#narrows_by_object_type;
 
     -- %test(refuses to run with no arguments at all)
     -- %throws(core_lock.c_app_exception_code)

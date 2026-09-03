@@ -19,13 +19,13 @@ COMMENT ON TABLE core_locks IS 'To track DDL events for objects locks';
 --
 COMMENT ON COLUMN core_locks.lock_id            IS 'Identity column, numbering from 10000. create_lock leaves it NULL and lets the identity assign it.';
 COMMENT ON COLUMN core_locks.object_owner       IS 'ORA_DICT_OBJ_OWNER of the DDL event.';
-COMMENT ON COLUMN core_locks.object_type        IS 'ORA_DICT_OBJ_TYPE. Only PACKAGE, PACKAGE BODY, PROCEDURE, FUNCTION, TRIGGER and VIEW get a hash.';
+COMMENT ON COLUMN core_locks.object_type        IS 'ORA_DICT_OBJ_TYPE, except that the SNAPSHOT the dictionary reports for a materialized view is recorded as MATERIALIZED VIEW, which is the name the rest of the feature uses. Only PACKAGE, PACKAGE BODY, PROCEDURE, FUNCTION, TRIGGER and VIEW get a hash.';
 COMMENT ON COLUMN core_locks.object_name        IS 'ORA_DICT_OBJ_NAME. CORE_LOCK% objects are never recorded, so the feature cannot lock itself out.';
 COMMENT ON COLUMN core_locks.locked_by          IS 'Lock owner, from get_user(): proxy user, else an un-overwritten CLIENT_IDENTIFIER, else recover_user() reading this column back for the same audit_trail, else the APEX session user, else the name inside a context key, else CLIENT_INFO, else the OS user, else the session IP. Every candidate goes through clean_user, which strips the trailing session number, drops names that are only digits or a pool account, and uppercases what is left. Never the schema account.';
 COMMENT ON COLUMN core_locks.locked_at          IS 'When this row was cut. Rebook anchor: a compile later than locked_at + g_lock_rebook closes this row and starts a new one.';
 COMMENT ON COLUMN core_locks.expire_at          IS 'Lock is live until this time. NULL means released by unlock, a past value means expired; both let another user take the object.';
 COMMENT ON COLUMN core_locks.counter            IS 'How many times extend_lock refreshed this row, i.e. compiles inside the rebook window. 1 at insert.';
-COMMENT ON COLUMN core_locks.object_payload     IS 'DDL text of the last compile in this rebook window, normalized by get_object(). This is the source backup; the CORE_LOCKS_PURGE job ditches it once the row leaves the 7-day retention window.';
+COMMENT ON COLUMN core_locks.object_payload     IS 'DDL text of the last compile in this rebook window, normalized by get_object(). This is the source backup; the CORE_LOCKS_PURGE job ditches it once the row leaves the 7-day retention window. A row opened by a DROP carries the source of the object that was dropped, since the drop statement itself is not source.';
 COMMENT ON COLUMN core_locks.object_hash        IS 'SHA-256 of object_payload as hex. NULL for object types without source, and cleared by unlock. Survives the purge job — one hash per unique object is kept.';
 COMMENT ON COLUMN core_locks.audit_trail        IS 'IP_ADDRESS|HOST|SESSIONTIMEZONE|MODULE of the session that cut this row. Set at insert only, never refreshed by extend_lock.';
 

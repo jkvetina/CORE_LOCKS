@@ -28,6 +28,12 @@ CREATE OR REPLACE PACKAGE core_lock_fixture AS
     c_view                  CONSTANT VARCHAR2(128) := 'CLUT_VW';
     c_trigger               CONSTANT VARCHAR2(128) := 'CLUT_TRG';
     c_table                 CONSTANT VARCHAR2(128) := 'CLUT_TAB';
+    c_mview                 CONSTANT VARCHAR2(128) := 'CLUT_MV';
+
+    -- a view whose text runs past the 32k a varchar2 holds, which is the whole
+    -- reason view_query reads the LONG in chunks and object_body walks lines
+    -- instead of cutting the CLOB
+    c_bigview               CONSTANT VARCHAR2(128) := 'CLUT_BIGVW';
 
     -- a type the locksmith deliberately does not track, for the test that proves
     -- the object-type filter is a filter and not a formality

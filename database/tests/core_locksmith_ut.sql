@@ -1,7 +1,13 @@
 CREATE OR REPLACE PACKAGE BODY core_locksmith_ut AS
 
+    --
+    -- The newest lock row for an object. The type narrows it because a
+    -- materialized view shares its name with the container table Oracle builds
+    -- underneath it, and a row for one is not a row for the other.
+    --
     FUNCTION newest_lock (
-        in_object_name      core_locks.object_name%TYPE
+        in_object_name      core_locks.object_name%TYPE,
+        in_object_type      core_locks.object_type%TYPE     := NULL
     )
     RETURN core_locks%ROWTYPE
     AS
@@ -10,12 +16,35 @@ CREATE OR REPLACE PACKAGE BODY core_locksmith_ut AS
         SELECT *
         INTO rec
         FROM core_locks t
-        WHERE t.object_name = in_object_name
+        WHERE t.object_name     = in_object_name
+            AND (t.object_type  = in_object_type OR in_object_type IS NULL)
         ORDER BY
             t.lock_id DESC
         FETCH FIRST 1 ROWS ONLY;
         --
         RETURN rec;
+    END;
+
+
+
+    --
+    -- Whether the probe is still in the schema. A refusal that raises but lets
+    -- the statement land is the failure the guard exists to prevent, and for a
+    -- DROP the object itself is the only witness left.
+    --
+    FUNCTION object_exists (
+        in_object_name      core_locks.object_name%TYPE
+    )
+    RETURN PLS_INTEGER
+    AS
+        v_out               PLS_INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+        INTO v_out
+        FROM user_objects t
+        WHERE t.object_name = in_object_name;
+        --
+        RETURN v_out;
     END;
 
 
@@ -232,6 +261,178 @@ CREATE OR REPLACE PACKAGE BODY core_locksmith_ut AS
         -- refusing is only half of it: the compile must not have landed either,
         -- or the guard reports an error over a change it already let through
         ut.expect(live_version(core_lock_fixture.c_proc)).to_be_like('%version 1%');
+    END;
+
+
+
+    PROCEDURE test_locksmith#a_trigger_compile_opens_a_lock
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        -- the trigger needs its table, and creating that table takes a lock of
+        -- its own, so the count below is about the trigger and nothing else
+        core_lock_fixture.compile_probe('TABLE');
+        core_lock_fixture.clear_locks();
+        --
+        core_lock_fixture.compile_probe('TRIGGER', 1);
+        --
+        rec := newest_lock(core_lock_fixture.c_trigger, 'TRIGGER');
+        --
+        ut.expect(core_lock_fixture.lock_count(core_lock_fixture.c_trigger)).to_equal(1);
+        ut.expect(rec.object_hash).to_be_not_null();
+        ut.expect(DBMS_LOB.INSTR(rec.object_payload, 'version 1')).to_be_greater_than(0);
+    END;
+
+
+
+    PROCEDURE test_locksmith#a_materialized_view_compile_opens_a_lock
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('MATERIALIZED VIEW', 1);
+        --
+        rec := newest_lock(core_lock_fixture.c_mview, 'MATERIALIZED VIEW');
+
+        -- the type has to be the one the rest of the feature uses and not the
+        -- SNAPSHOT the dictionary reports, or a lock taken by a compile and one
+        -- taken by hand are about two different objects. It is outside the list
+        -- create_lock fingerprints, so the backup is all this one gets
+        ut.expect(core_lock_fixture.lock_count(core_lock_fixture.c_mview, 'MATERIALIZED VIEW')).to_equal(1);
+        ut.expect(rec.locked_by).to_equal(core_lock_fixture.c_alice);
+        ut.expect(DBMS_LOB.INSTR(rec.object_payload, 'SELECT 1 AS x')).to_be_greater_than(0);
+    END;
+
+
+
+    PROCEDURE test_locksmith#an_alter_that_is_not_a_compile_opens_a_lock
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('TABLE');
+        core_lock_fixture.clear_locks();
+        --
+        EXECUTE IMMEDIATE 'ALTER TABLE ' || core_lock_fixture.c_table || ' ADD (note VARCHAR2(10))';
+        --
+        rec := newest_lock(core_lock_fixture.c_table, 'TABLE');
+
+        -- only ALTER ... COMPILE means "not a change". Every other ALTER is one,
+        -- and the statement is the only record of what it did to the object
+        ut.expect(core_lock_fixture.lock_count(core_lock_fixture.c_table)).to_equal(1);
+        ut.expect(UPPER(DBMS_LOB.SUBSTR(rec.object_payload, 200, 1))).to_be_like('%ADD%');
+    END;
+
+
+
+    PROCEDURE test_locksmith#a_big_view_fingerprints_the_same_by_hand
+    AS
+        v_by_compile        core_locks.object_hash%TYPE;
+        v_by_hand           core_locks.object_hash%TYPE;
+    BEGIN
+        -- a first version, so the text the dictionary held before this compile is
+        -- never the text it holds after it
+        core_lock_fixture.compile_probe('BIG VIEW', 1);
+        core_lock_fixture.clear_locks();
+        --
+        core_lock_fixture.compile_probe('BIG VIEW', 2);
+        v_by_compile := newest_lock(core_lock_fixture.c_bigview, 'VIEW').object_hash;
+        --
+        core_lock_fixture.age_lock (
+            in_object_name  => core_lock_fixture.c_bigview,
+            in_expire_at    => SYSDATE - 1/1440
+        );
+        --
+        core_lock_fixture.act_as(core_lock_fixture.c_bob);
+        core_lock.create_lock(USER, 'VIEW', core_lock_fixture.c_bigview);
+        --
+        v_by_hand := newest_lock(core_lock_fixture.c_bigview, 'VIEW').object_hash;
+
+        -- past 32k both readers still have to arrive at the same text: the
+        -- trigger walks a CLOB of the statement, and the hand lock reads the
+        -- LONG the dictionary keeps a view's query in, one chunk at a time
+        ut.expect(v_by_compile).to_be_not_null();
+        ut.expect(v_by_hand).to_equal(v_by_compile);
+    END;
+
+
+
+    PROCEDURE test_locksmith#a_drop_is_recorded_not_refused
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+
+        -- the lock has run out but it was cut a moment ago, which is the window
+        -- the fingerprint check owns. A DROP has no source to fingerprint, and
+        -- hashing the statement instead compared "DROP PROCEDURE CLUT_PROC"
+        -- against the procedure's own text: those can never match, so every drop
+        -- inside that minute came back as somebody else's change
+        core_lock_fixture.age_lock (
+            in_object_name  => core_lock_fixture.c_proc,
+            in_expire_at    => SYSDATE - 1/1440
+        );
+        --
+        core_lock_fixture.act_as(core_lock_fixture.c_bob);
+        --
+        EXECUTE IMMEDIATE 'DROP PROCEDURE ' || core_lock_fixture.c_proc;
+        --
+        rec := newest_lock(core_lock_fixture.c_proc, 'PROCEDURE');
+        --
+        ut.expect(object_exists(core_lock_fixture.c_proc)).to_equal(0);
+        ut.expect(rec.locked_by).to_equal(core_lock_fixture.c_bob);
+    END;
+
+
+
+    PROCEDURE test_locksmith#a_drop_carries_the_last_source_forward
+    AS
+        rec                 core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        --
+        core_lock_fixture.age_lock (
+            in_object_name  => core_lock_fixture.c_proc,
+            in_expire_at    => SYSDATE - 1/1440
+        );
+        --
+        core_lock_fixture.act_as(core_lock_fixture.c_bob);
+        --
+        EXECUTE IMMEDIATE 'DROP PROCEDURE ' || core_lock_fixture.c_proc;
+        --
+        rec := newest_lock(core_lock_fixture.c_proc, 'PROCEDURE');
+
+        -- the row a drop opens is the last place that source exists, and it is
+        -- the newest row for the object, which is the one row the purge always
+        -- keeps. Leave it empty and the backup for a dropped object is the first
+        -- thing the housekeeping throws away
+        ut.expect(DBMS_LOB.INSTR(rec.object_payload, 'version 1')).to_be_greater_than(0);
+        ut.expect(rec.object_hash).to_be_not_null();
+    END;
+
+
+
+    PROCEDURE test_locksmith#a_live_lock_still_refuses_a_drop
+    AS
+        v_error             VARCHAR2(4000);
+    BEGIN
+        -- Alice compiles and walks away holding the lock
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        --
+        core_lock_fixture.act_as(core_lock_fixture.c_bob);
+        --
+        BEGIN
+            EXECUTE IMMEDIATE 'DROP PROCEDURE ' || core_lock_fixture.c_proc;
+        EXCEPTION
+        WHEN OTHERS THEN
+            -- the whole stack, because a refusal raised inside a DDL trigger
+            -- surfaces as ORA-04088 with the reason underneath it
+            v_error := DBMS_UTILITY.FORMAT_ERROR_STACK;
+        END;
+
+        -- letting a drop past the fingerprint check must not let it past the
+        -- clock as well: destroying an object somebody is holding is the worst
+        -- of the cases this lock exists for
+        ut.expect(v_error).to_be_like('%LOCK_TIME_ERROR%');
+        ut.expect(object_exists(core_lock_fixture.c_proc)).to_equal(1);
     END;
 
 END;

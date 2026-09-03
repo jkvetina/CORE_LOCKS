@@ -227,7 +227,9 @@ Every candidate passes through `core_lock.clean_user` first. That strips a trail
 
 `core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it first refuses the statement outright when `core_lock.get_user()` comes back NULL, which means a session that offered no proxy user, no usable identifier, no history for its workstation, no APEX user, no operating system login and no IP address (see [The IP fallback](#the-ip-fallback)), and then calls `core_lock.create_lock`.
 
-`create_lock` captures the statement's own text through `ora_sql_txt` and keeps it as the backup, and skips `ALTER ... COMPILE` entirely – recompiling is not a change. Source-bearing object types are then hashed with SHA-256, and what gets hashed is the object **without its CREATE header**. That header is the one part of the text nobody writes the same way twice, so dropping it is what makes two fingerprints of the same object comparable. See [Create lock](#create-lock) for why that matters the moment you take a lock by hand.
+A materialized view is the one type where the dictionary and the lock row call the same thing by different names. Every DDL event Oracle fires for one reports `ORA_DICT_OBJ_TYPE` as `SNAPSHOT`, so that is what the trigger's filter asks for, and it records `MATERIALIZED VIEW`, which is the name `object_body` and `DBMS_METADATA` both use. One object under one type name is what lets a lock taken by a compile and a lock taken by hand find each other in the history.
+
+`create_lock` captures the statement's own text through `ora_sql_txt` and keeps it as the backup, and skips `ALTER ... COMPILE` entirely, because recompiling is not a change. A `DROP` is the other statement that is not source: it opens a lock like anything else, but the row it opens carries the source of what was dropped rather than the text of the drop, which makes that row the last surviving backup of the object. Source-bearing object types are then hashed with SHA-256, and what gets hashed is the object **without its CREATE header**. That header is the one part of the text nobody writes the same way twice, so dropping it is what makes two fingerprints of the same object comparable. See [Create lock](#create-lock) for why that matters the moment you take a lock by hand.
 
 It then reads the most recent lock row for that object and decides:
 
@@ -384,12 +386,12 @@ ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 
 ## 9. Tests
 
-There are 42 utPLSQL tests in two suites, and they cover every public routine in `core_lock` plus the `core_locksmith` trigger.
+There are 60 utPLSQL tests in two suites, and they cover every public routine in `core_lock`, every optional argument those routines take, and the `core_locksmith` trigger across all three events and every tracked object type.
 
 | File | What it holds |
 | --- | --- |
-| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 35 tests |
-| `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 7 tests |
+| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 46 tests |
+| `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 14 tests |
 | `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, teardown ledger |
 | `database/tests/create_test_user.sql` | Creates the throwaway schema, run as SYSDBA |
 | `database/tests/install.sql` | Installs product and suites, then proves the install |
@@ -415,10 +417,14 @@ The two scheduler jobs are not installed by `install.sql`. `CORE_LOCKSMITH_ENABL
 
 ### Every test has been seen red
 
-Green proves a suite runs; only red proves it asserts. Each of the 42 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, the retention window in `purge_locks`, the name and type filters in the trigger, and so on for 36 separate breakages. Every one of them was caught, and every test died to at least one.
+Green proves a suite runs; only red proves it asserts. Each of the 60 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, and so on for 53 separate breakages across two sweeps. Every one of them was caught, and every test died to at least one.
 
 That discipline found two tests that could not fail as first written. One compared a hand-booked lock against a compiled one using probe source whose `CREATE` header was already spelled the way the dictionary spells it, so the two texts matched with the header left on and the strip stopped mattering. The probe headers are lower case and doubly spaced now, which is what a developer actually types and what normalisation cannot close. The other checked the self-exclusion rule by recompiling the trigger itself, and Oracle does not fire a schema DDL trigger for DDL on that same trigger, so the assertion never had anything to be wrong about.
 
+It also found two product bugs, both in behaviour the code claimed to have. A `DROP` was fingerprinted against the object it was destroying and refused as somebody else's change, and a materialized view was tracked under a name the dictionary never uses. Neither showed up in a review of the same code that wrote them.
+
 ### Coverage
 
-83.2% across 867 lines of `core_lock` and `core_locksmith`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
+85.2% across 908 lines of `core_lock` and `core_locksmith`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
+
+`core_locksmith` itself reports zero covered lines whatever the suite does, because the profiler does not instrument a DDL trigger. The 14 tests in the trigger suite drive it through real compiles, and the mutation sweep breaks it on purpose, which is the only evidence that it runs at all.

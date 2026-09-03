@@ -7,6 +7,8 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
     c_drop_order        CONSTANT t_probe_list := t_probe_list (
         'TRIGGER',
         'VIEW',
+        'BIG VIEW',
+        'MATERIALIZED VIEW',
         'FUNCTION',
         'PROCEDURE',
         'OWN',
@@ -36,6 +38,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
         -- the one line that differs between the two versions, and it sits in the
         -- body rather than the header on purpose
         v_mark              VARCHAR2(64) := CASE WHEN in_version = 1 THEN '1' ELSE '2' END;
+        v_out               CLOB;
     BEGIN
         --
         -- The CREATE headers below are lower case and doubly spaced, and both are
@@ -114,6 +117,27 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
                 'END;'
             );
             --
+        WHEN 'MATERIALIZED VIEW' THEN
+            RETURN TO_CLOB (
+                'create  materialized  view ' || LOWER(c_mview) || ' as' || CHR(10) ||
+                'SELECT ' || v_mark || ' AS x FROM dual'
+            );
+            --
+        WHEN 'BIG VIEW' THEN
+            -- padded past 32k with predicates rather than one long literal, because a
+            -- SQL string literal caps at 4000 characters and the point is the length
+            -- of the view TEXT, which Oracle keeps as a LONG
+            v_out := TO_CLOB (
+                'create  or  replace  view ' || LOWER(c_bigview) || ' as' || CHR(10) ||
+                'SELECT ' || v_mark || ' AS x FROM dual WHERE 1 = 1' || CHR(10)
+            );
+            --
+            FOR i IN 1 .. 1800 LOOP
+                v_out := v_out || '    AND ''a'' != ''pad' || LPAD(i, 6, '0') || '''' || CHR(10);
+            END LOOP;
+            --
+            RETURN v_out;
+            --
         WHEN 'TABLE' THEN
             -- a table carries no source, so it has no second version to offer
             RETURN TO_CLOB('CREATE TABLE ' || c_table || ' (id NUMBER)');
@@ -139,11 +163,15 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
     )
     AS
     BEGIN
-        -- neither a TABLE nor a SEQUENCE has a CREATE OR REPLACE form
-        IF in_object_type IN ('TABLE', 'SEQUENCE') THEN
+        -- a TABLE, a SEQUENCE and a MATERIALIZED VIEW have no CREATE OR REPLACE form
+        IF in_object_type IN ('TABLE', 'SEQUENCE', 'MATERIALIZED VIEW') THEN
             BEGIN
                 EXECUTE IMMEDIATE 'DROP ' || in_object_type || ' '
-                    || CASE in_object_type WHEN 'TABLE' THEN c_table ELSE c_sequence END
+                    || CASE in_object_type
+                        WHEN 'TABLE'    THEN c_table
+                        WHEN 'SEQUENCE' THEN c_sequence
+                        ELSE c_mview
+                       END
                     || CASE in_object_type WHEN 'TABLE' THEN ' PURGE' END;
             EXCEPTION
             WHEN OTHERS THEN
@@ -163,18 +191,25 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
     BEGIN
         FOR i IN 1 .. c_drop_order.COUNT LOOP
             v_name := CASE c_drop_order(i)
-                WHEN 'TRIGGER'      THEN c_trigger
-                WHEN 'VIEW'         THEN c_view
-                WHEN 'FUNCTION'     THEN c_fn
-                WHEN 'PROCEDURE'    THEN c_proc
-                WHEN 'OWN'          THEN c_own
-                WHEN 'PACKAGE'      THEN c_pkg
-                WHEN 'SEQUENCE'     THEN c_sequence
-                WHEN 'TABLE'        THEN c_table
+                WHEN 'TRIGGER'              THEN c_trigger
+                WHEN 'VIEW'                 THEN c_view
+                WHEN 'BIG VIEW'             THEN c_bigview
+                WHEN 'MATERIALIZED VIEW'    THEN c_mview
+                WHEN 'FUNCTION'             THEN c_fn
+                WHEN 'PROCEDURE'            THEN c_proc
+                WHEN 'OWN'                  THEN c_own
+                WHEN 'PACKAGE'              THEN c_pkg
+                WHEN 'SEQUENCE'             THEN c_sequence
+                WHEN 'TABLE'                THEN c_table
             END;
             --
-            -- OWN is a probe role, not an object type; it is dropped as what it is
-            v_type := CASE c_drop_order(i) WHEN 'OWN' THEN 'PROCEDURE' ELSE c_drop_order(i) END;
+            -- OWN and BIG VIEW are probe roles, not object types; each is dropped
+            -- as whatever it actually is
+            v_type := CASE c_drop_order(i)
+                WHEN 'OWN'      THEN 'PROCEDURE'
+                WHEN 'BIG VIEW' THEN 'VIEW'
+                ELSE c_drop_order(i)
+            END;
             --
             BEGIN
                 EXECUTE IMMEDIATE 'DROP ' || v_type || ' ' || v_name
@@ -187,7 +222,8 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
                 --   -4043  package, procedure, function
                 --   -4080  trigger
                 --   -2289  sequence
-                IF SQLCODE NOT IN (-942, -4043, -4080, -2289) THEN
+                --   -12003 materialized view
+                IF SQLCODE NOT IN (-942, -4043, -4080, -2289, -12003) THEN
                     RAISE;
                 END IF;
             END;
@@ -328,7 +364,8 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
         SELECT COUNT(*)
         INTO v_left
         FROM user_objects t
-        WHERE t.object_name IN (c_pkg, c_proc, c_fn, c_view, c_trigger, c_table, c_sequence, c_own);
+        WHERE t.object_name IN (c_pkg, c_proc, c_fn, c_view, c_bigview, c_mview,
+            c_trigger, c_table, c_sequence, c_own);
         --
         g_residue := v_left + lock_count();
     END;

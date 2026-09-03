@@ -13,6 +13,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
     -- empty payload that means "not a change" rather than "no statement to read"
     g_alter_compile     BOOLEAN := FALSE;
 
+    -- set by get_object when the statement it read was a DROP. The text of a DROP
+    -- is not the object's source, so hashing it compares "DROP PROCEDURE X" against
+    -- a source fingerprint, which can never match and refused every drop of a
+    -- recently locked object with OBJECT_CHANGED_BY when nothing had changed
+    g_drop_event        BOOLEAN := FALSE;
+
 
 
     FUNCTION dict_object (
@@ -207,6 +213,11 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         --
         rec                 core_locks%ROWTYPE;
         v_hash_check        BOOLEAN := in_hash_check;
+        --
+        -- what the object looked like before this statement, kept so a DROP row can
+        -- carry the source of the thing that was dropped
+        v_last_payload      core_locks.object_payload%TYPE;
+        v_last_hash         core_locks.object_hash%TYPE;
     BEGIN
         -- check if we have a valid user
         rec.locked_by := COALESCE(in_locked_by, get_user());
@@ -220,8 +231,9 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         --
         -- an ALTER ... COMPILE is the one empty payload that means "not a change",
         -- so it is the only one that opens no lock. Anything else locks with the
-        -- payload it has, NULL included: a TABLE carries no source and a lock taken
-        -- outside a compile is still a lock
+        -- payload it has, NULL included: a TABLE carries no source, a DROP has a
+        -- statement that is not source, and a lock taken outside a compile is
+        -- still a lock
         IF g_alter_compile THEN
             RETURN;
         END IF;
@@ -249,7 +261,8 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 t.locked_by,
                 t.locked_at,
                 t.expire_at,
-                t.object_hash
+                t.object_hash,
+                t.object_payload
             FROM core_locks t
             WHERE t.object_owner    = in_object_owner
                 AND t.object_type   = in_object_type
@@ -258,6 +271,9 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 t.lock_id DESC
             FETCH FIRST 1 ROWS ONLY
         ) LOOP
+            v_last_payload  := c.object_payload;
+            v_last_hash     := c.object_hash;
+            --
             IF c.locked_by = rec.locked_by THEN
                 -- same user, so just extend the lock
                 rec.lock_id     := c.lock_id;
@@ -271,7 +287,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 -- check object hash
                 -- when you take over an object, you should compile it right away, without any changes
                 -- that will make sure you are not overriding any changes done by someone else in the meantime
-                raise_error('LOCK_HASH_ERROR: OBJECT_CHANGED_BY `' || c.locked_by || TO_CHAR(c.expire_at, 'YYYY-MM-DD HH24:MI') || '` [' || c.lock_id || ']');
+                raise_error('LOCK_HASH_ERROR: OBJECT_CHANGED_BY `' || c.locked_by || ' ' || TO_CHAR(c.expire_at, 'YYYY-MM-DD HH24:MI') || '` [' || c.lock_id || ']');
             END IF;
         END LOOP;
 
@@ -290,6 +306,15 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 in_lock_id => rec.lock_id
             );
         ELSE
+            -- a DROP has no source of its own, so the row it opens carries the source
+            -- of what was dropped. Without this the newest row for the object is a
+            -- payload-less one, and the purge keeps exactly that row and deletes the
+            -- older ones, so the backup for a dropped object is the first thing lost
+            IF g_drop_event THEN
+                rec.object_payload  := v_last_payload;
+                rec.object_hash     := v_last_hash;
+            END IF;
+            --
             -- lock_id stays NULL, the identity column assigns it on insert
             rec.object_owner    := in_object_owner;
             rec.object_type     := in_object_type;
@@ -772,8 +797,10 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         v_out           CLOB;
         v_rows          PLS_INTEGER;
         v_alter         BOOLEAN := FALSE;
+        v_drop          BOOLEAN := FALSE;
     BEGIN
         g_alter_compile := FALSE;
+        g_drop_event    := FALSE;
 
         -- get object source into a CLOB. ora_sql_txt carries a statement only inside
         -- a DDL trigger and raises anywhere else, which is what stopped create_lock
@@ -821,6 +848,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 IF UPPER(c.column_value) LIKE 'ALTER%' THEN
                     v_alter := TRUE;
                 END IF;
+                --
+                -- case insensitive, because the uppercase pass above only fixes the
+                -- CREATE spellings and a developer types DROP in whatever case they like
+                IF REGEXP_LIKE(c.column_value, '^\s*DROP\s', 'i') THEN
+                    v_drop := TRUE;
+                END IF;
             END IF;
 
             -- the last line used to be stripped here, to drop the terminator a client
@@ -839,6 +872,14 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         --
         IF v_alter AND INSTR(UPPER(v_out), 'COMPILE') > 0 THEN
             g_alter_compile := TRUE;
+            RETURN NULL;
+        END IF;
+
+        -- a DROP still opens a lock, it is just not a source of one. Handing the
+        -- statement back would put "DROP PROCEDURE X" in the payload column where the
+        -- object's own text belongs, and fingerprint that instead of the object
+        IF v_drop THEN
+            g_drop_event := TRUE;
             RETURN NULL;
         END IF;
         --
