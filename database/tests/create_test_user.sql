@@ -53,8 +53,31 @@ GRANT CREATE JOB                TO core_locks;
 GRANT CREATE SYNONYM            TO core_locks;
 GRANT CREATE TYPE               TO core_locks;
 
+-- The account the proxy suite connects through. It owns nothing and may do
+-- nothing but connect: a session authenticating as CLUT_PROXY runs as
+-- CORE_LOCKS, with SYS_CONTEXT('USERENV','PROXY_USER') naming the account that
+-- vouched for it. That is the top rung of get_user's ladder and the one rung no
+-- session can set for itself, so testing it needs a second account rather than
+-- a fixture. The password is a throwaway for the same reason the schema's is.
+BEGIN
+    EXECUTE IMMEDIATE 'DROP USER clut_proxy CASCADE';
+EXCEPTION
+WHEN OTHERS THEN
+    IF SQLCODE != -1918 THEN  -- user does not exist
+        RAISE;
+    END IF;
+END;
+/
+
+CREATE USER clut_proxy IDENTIFIED BY "clut_proxy";
+
+GRANT CREATE SESSION TO clut_proxy;
+
+ALTER USER core_locks GRANT CONNECT THROUGH clut_proxy;
+
 -- core_lock hashes CLOBs, names the session's user, reads the dictionary
--- and registers the purge job
+-- and registers the purge job. DBMS_SESSION also carries SLEEP, which is how the
+-- concurrency suite waits for the session it borrowed from the scheduler
 GRANT EXECUTE ON DBMS_CRYPTO            TO core_locks;
 GRANT EXECUTE ON DBMS_SESSION           TO core_locks;
 GRANT EXECUTE ON DBMS_METADATA          TO core_locks;

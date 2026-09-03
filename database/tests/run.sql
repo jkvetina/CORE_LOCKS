@@ -13,6 +13,11 @@
 --                                  stopped being discovered, and an empty green
 --                                  run is exactly what that looks like
 --
+-- The proxy suite is tagged out here rather than left out of the install.
+-- PROXY_USER is set when the session connects and cannot be arranged from inside
+-- one, so on this connection those tests would be failing for the connection's
+-- reason and not the product's. run_proxy.sql runs them through a proxy connection.
+--
 set serveroutput on size unlimited
 set lines 200 pages 0 feed off verify off
 whenever sqlerror exit failure
@@ -27,7 +32,7 @@ DECLARE
 BEGIN
     FOR c IN (
         SELECT column_value AS line
-        FROM TABLE(ut.run())
+        FROM TABLE(ut.run(a_tags => '-proxy'))
     ) LOOP
         DBMS_OUTPUT.PUT_LINE(c.line);
         --

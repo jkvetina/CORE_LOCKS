@@ -36,6 +36,10 @@ PROMPT ===== test fixture and suites
 @database/tests/core_lock_ut.sql
 @database/tests/core_locksmith_ut.spec.sql
 @database/tests/core_locksmith_ut.sql
+@database/tests/core_lock_conc_ut.spec.sql
+@database/tests/core_lock_conc_ut.sql
+@database/tests/core_lock_proxy_ut.spec.sql
+@database/tests/core_lock_proxy_ut.sql
 
 PROMPT
 PROMPT ===== the locksmith starts enabled, whatever a half-finished run left behind
@@ -82,6 +86,10 @@ END;
 PROMPT
 PROMPT Installed. Run the suites with:
 PROMPT     sqlplus core_locks/core_locks@<host>:<port>/<service> @database/tests/run.sql
+PROMPT
+PROMPT The proxy suite is tagged out of that run and needs a proxy connection:
+PROMPT     sqlplus CLUT_PROXY[CORE_LOCKS]/clut_proxy@<host>:<port>/<service> @database/tests/run_proxy.sql
+PROMPT     (run.sh does both)
 PROMPT
 
 EXIT;

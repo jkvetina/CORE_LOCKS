@@ -17,6 +17,46 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
         'TABLE'
     );
 
+    -- the racer job names, as a LIKE pattern and as a stem
+    c_race_stem         CONSTANT VARCHAR2(30)  := 'CLUT_RACE_';
+    c_race_like         CONSTANT VARCHAR2(30)  := 'CLUT\_RACE\_%';
+
+    -- how many run-log rows the racer jobs had before the current race. The
+    -- scheduler's run log is append only and outlives DROP_JOB, so a wait for a
+    -- count of N returns instantly on the second race and reads the first race's
+    -- verdict. Every wait below is for rows added since this baseline
+    g_race_base         PLS_INTEGER := 0;
+
+
+
+    PROCEDURE drop_job (
+        in_name             VARCHAR2
+    )
+    AS
+    BEGIN
+        DBMS_SCHEDULER.DROP_JOB(in_name, TRUE);
+    EXCEPTION
+    WHEN OTHERS THEN
+        NULL;   -- not there, which is the normal first run
+    END;
+
+
+
+    FUNCTION job_runs (
+        in_pattern          VARCHAR2
+    )
+    RETURN PLS_INTEGER
+    AS
+        v_out               PLS_INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+        INTO v_out
+        FROM user_scheduler_job_run_details t
+        WHERE t.job_name LIKE in_pattern ESCAPE '\';
+        --
+        RETURN v_out;
+    END;
+
 
 
     PROCEDURE act_as (
@@ -310,9 +350,151 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
 
 
 
+    PROCEDURE in_other_session (
+        in_body             VARCHAR2,
+        in_wait_seconds     NUMBER      := 30
+    )
+    AS
+        v_base              PLS_INTEGER;
+        v_now               PLS_INTEGER := 0;
+        v_waited            NUMBER      := 0;
+    BEGIN
+        g_job_status    := NULL;
+        g_job_error     := NULL;
+        --
+        drop_job(c_job);
+        v_base := job_runs(c_job);
+        --
+        DBMS_SCHEDULER.CREATE_JOB (
+            job_name    => c_job,
+            job_type    => 'PLSQL_BLOCK',
+            job_action  => in_body,
+            enabled     => FALSE
+        );
+        --
+        -- use_current_session FALSE is the whole point: TRUE would run the block
+        -- right here and the suite would be talking to itself again
+        DBMS_SCHEDULER.RUN_JOB(c_job, use_current_session => FALSE);
+        --
+        WHILE v_now <= v_base AND v_waited < in_wait_seconds LOOP
+            DBMS_SESSION.SLEEP(0.05);
+            v_waited    := v_waited + 0.05;
+            v_now       := job_runs(c_job);
+        END LOOP;
+        --
+        IF v_now <= v_base THEN
+            -- reported, never waited out silently: a test that gave up waiting and
+            -- then asserted on an empty lock table would read as a passing guard
+            g_job_status    := 'TIMEOUT';
+            g_job_error     := 'the other session did not finish within ' || in_wait_seconds || 's';
+            drop_job(c_job);
+            RETURN;
+        END IF;
+        --
+        SELECT
+            MAX(t.status) KEEP (DENSE_RANK LAST ORDER BY t.log_id),
+            SUBSTR(MAX(t.additional_info) KEEP (DENSE_RANK LAST ORDER BY t.log_id), 1, 4000)
+        INTO g_job_status, g_job_error
+        FROM user_scheduler_job_run_details t
+        WHERE t.job_name = c_job;
+        --
+        drop_job(c_job);
+    END;
+
+
+
+    PROCEDURE start_racers (
+        in_count            PLS_INTEGER,
+        in_object_type      VARCHAR2,
+        in_object_name      VARCHAR2,
+        in_delay_seconds    PLS_INTEGER := 2
+    )
+    AS
+        v_when              TIMESTAMP WITH TIME ZONE;
+    BEGIN
+        drop_jobs();
+        --
+        g_racers_done   := 0;
+        g_race_base     := job_runs(c_race_like);
+
+        -- one start time shared by all of them. RUN_JOB starts a slave whenever it
+        -- gets round to it, and six of those in a row is not a race: it is six
+        -- calls in sequence, which the guard passes whatever it does about
+        -- simultaneity. A start_date in the near future is what releases them together
+        v_when := SYSTIMESTAMP + NUMTODSINTERVAL(in_delay_seconds, 'SECOND');
+        --
+        FOR i IN 1 .. in_count LOOP
+            DBMS_SCHEDULER.CREATE_JOB (
+                job_name    => c_race_stem || i,
+                job_type    => 'PLSQL_BLOCK',
+                job_action  => 'BEGIN DBMS_SESSION.SET_IDENTIFIER(''RACER' || i || ''');'
+                    || ' core_lock.create_lock(USER, ''' || in_object_type || ''', ''' || in_object_name || '''); END;',
+                start_date  => v_when,
+                enabled     => TRUE
+            );
+        END LOOP;
+    END;
+
+
+
+    PROCEDURE await_racers (
+        in_count            PLS_INTEGER,
+        in_wait_seconds     NUMBER      := 60
+    )
+    AS
+        v_now               PLS_INTEGER := 0;
+        v_waited            NUMBER      := 0;
+    BEGIN
+        WHILE v_now - g_race_base < in_count AND v_waited < in_wait_seconds LOOP
+            DBMS_SESSION.SLEEP(0.1);
+            v_waited    := v_waited + 0.1;
+            v_now       := job_runs(c_race_like);
+        END LOOP;
+        --
+        g_racers_done := v_now - g_race_base;
+        --
+        drop_jobs();
+    END;
+
+
+
+    PROCEDURE drop_jobs
+    AS
+    BEGIN
+        FOR c IN (
+            SELECT t.job_name
+            FROM user_scheduler_jobs t
+            WHERE t.job_name        = c_job
+                OR t.job_name LIKE c_race_like ESCAPE '\'
+        ) LOOP
+            drop_job(c.job_name);
+        END LOOP;
+    END;
+
+
+
+    FUNCTION live_lock_count (
+        in_object_name      VARCHAR2    := NULL
+    )
+    RETURN PLS_INTEGER
+    AS
+        v_out               PLS_INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+        INTO v_out
+        FROM core_locks t
+        WHERE (t.object_name    = in_object_name OR in_object_name IS NULL)
+            AND t.expire_at     >= SYSDATE;
+        --
+        RETURN v_out;
+    END;
+
+
+
     PROCEDURE teardown
     AS
         v_left              PLS_INTEGER;
+        v_jobs              PLS_INTEGER;
         v_was               VARCHAR2(30);
     BEGIN
         g_teardown_error := NULL;
@@ -351,6 +533,15 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
             g_teardown_error := SUBSTR(g_teardown_error || ' CLEAR_LOCKS: ' || SQLERRM, 1, 4000);
         END;
         --
+        -- a racer left behind does not sit still: its start_date arrives during
+        -- somebody else's test and it takes a lock nobody asked for
+        BEGIN
+            drop_jobs();
+        EXCEPTION
+        WHEN OTHERS THEN
+            g_teardown_error := SUBSTR(g_teardown_error || ' DROP_JOBS: ' || SQLERRM, 1, 4000);
+        END;
+        --
         IF v_was = 'ENABLED' THEN
             BEGIN
                 locksmith(TRUE);
@@ -367,7 +558,13 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
         WHERE t.object_name IN (c_pkg, c_proc, c_fn, c_view, c_bigview, c_mview,
             c_trigger, c_table, c_sequence, c_own);
         --
-        g_residue := v_left + lock_count();
+        SELECT COUNT(*)
+        INTO v_jobs
+        FROM user_scheduler_jobs t
+        WHERE t.job_name        = c_job
+            OR t.job_name LIKE c_race_like ESCAPE '\';
+        --
+        g_residue := v_left + v_jobs + lock_count();
     END;
 
 END;

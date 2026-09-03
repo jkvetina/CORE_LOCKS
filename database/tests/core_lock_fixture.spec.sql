@@ -48,11 +48,30 @@ CREATE OR REPLACE PACKAGE core_lock_fixture AS
     c_alice                 CONSTANT VARCHAR2(128) := 'ALICE';
     c_bob                   CONSTANT VARCHAR2(128) := 'BOB';
 
+    -- the account the proxy suite connects through. It owns nothing and may do
+    -- nothing but connect; its whole job is to make SYS_CONTEXT('USERENV',
+    -- 'PROXY_USER') answer, which no session can arrange for itself
+    c_proxy                 CONSTANT VARCHAR2(128) := 'CLUT_PROXY';
+
+    -- the scheduler job the concurrency suite borrows a second session from
+    c_job                   CONSTANT VARCHAR2(128) := 'CLUT_JOB';
+
     -- what teardown could not remove, and why. The last test of each suite
     -- asserts both are clean: a teardown that swallows its own failure is the
     -- appearance of cleanup, and committed fixtures make the leftovers permanent
     g_residue               PLS_INTEGER := 0;
     g_teardown_error        VARCHAR2(4000);
+
+    -- how the last borrowed session ended. SUCCEEDED or FAILED as the scheduler
+    -- saw it, plus the error stack it recorded, which is where a refusal raised
+    -- in that other session is legible from this one
+    g_job_status            VARCHAR2(30);
+    g_job_error             VARCHAR2(4000);
+
+    -- how many racers actually ran. Asserted alongside every claim about the
+    -- outcome of a race, because "one holder" is also what you get when nothing
+    -- raced at all, and that reads exactly like the guard working
+    g_racers_done           PLS_INTEGER := 0;
 
 
 
@@ -123,6 +142,57 @@ CREATE OR REPLACE PACKAGE core_lock_fixture AS
     FUNCTION lock_count (
         in_object_name      VARCHAR2    := NULL,
         in_object_type      VARCHAR2    := NULL
+    )
+    RETURN PLS_INTEGER;
+
+
+
+    --
+    -- Run one PL/SQL block in a session that is not this one, and wait for it.
+    --
+    -- Everything core_lock commits, it commits autonomously, and a single session
+    -- reading back its own committed rows cannot tell a working lock from a
+    -- variable. A scheduler job runs in a slave session with its own SID, its own
+    -- transaction and no client identifier until it sets one, which is as close to
+    -- a second developer as one connection can get.
+    --
+    -- Leaves g_job_status and g_job_error describing how it went.
+    --
+    PROCEDURE in_other_session (
+        in_body             VARCHAR2,
+        in_wait_seconds     NUMBER      := 30
+    );
+
+
+
+    --
+    -- Arrange in_count sessions to call create_lock on the same object at the same
+    -- moment. They share one start time rather than being launched one after
+    -- another, because six calls in a row is not a race and would pass whatever
+    -- the guard did.
+    --
+    PROCEDURE start_racers (
+        in_count            PLS_INTEGER,
+        in_object_type      VARCHAR2,
+        in_object_name      VARCHAR2,
+        in_delay_seconds    PLS_INTEGER := 2
+    );
+
+
+
+    PROCEDURE await_racers (
+        in_count            PLS_INTEGER,
+        in_wait_seconds     NUMBER      := 60
+    );
+
+
+
+    PROCEDURE drop_jobs;
+
+
+
+    FUNCTION live_lock_count (
+        in_object_name      VARCHAR2    := NULL
     )
     RETURN PLS_INTEGER;
 

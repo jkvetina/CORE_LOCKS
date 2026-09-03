@@ -386,17 +386,20 @@ ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 
 ## 9. Tests
 
-There are 60 utPLSQL tests in two suites, and they cover every public routine in `core_lock`, every optional argument those routines take, and the `core_locksmith` trigger across all three events and every tracked object type.
+There are 69 utPLSQL tests in four suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the two things one session cannot show about itself: a lock seen from another session, and an owner the database vouched for.
 
 | File | What it holds |
 | --- | --- |
 | `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 46 tests |
 | `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 14 tests |
-| `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, teardown ledger |
-| `database/tests/create_test_user.sql` | Creates the throwaway schema, run as SYSDBA |
+| `database/tests/core_lock_conc_ut.spec.sql` / `.sql` | Two sessions at once, borrowed from the scheduler. 4 tests |
+| `database/tests/core_lock_proxy_ut.spec.sql` / `.sql` | Ownership through a proxy connection. 5 tests |
+| `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, second sessions, teardown ledger |
+| `database/tests/create_test_user.sql` | Creates the throwaway schema and its proxy account, run as SYSDBA |
 | `database/tests/install.sql` | Installs product and suites, then proves the install |
-| `database/tests/run.sql` | Runs everything and fails the session when it is not green |
-| `database/tests/run.sh` | Does both of the above from any working directory |
+| `database/tests/run.sql` | Runs everything except the proxy tag, and fails the session when it is not green |
+| `database/tests/run_proxy.sql` | Runs the proxy tag, and refuses a connection that has no proxy user |
+| `database/tests/run.sh` | Does all of the above from any working directory |
 
 You need utPLSQL v3 (measured against v3.2.3.4508 on 23ai) and the same `APEX_STRING` and `DBMS_CRYPTO` access the feature itself needs.
 
@@ -405,19 +408,37 @@ sqlplus "sys/<password>@<host>:<port>/<service> as sysdba" @database/tests/creat
 database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service>
 ```
 
+### Two connections, because two of the tests cannot be faked
+
+`run.sh` makes two connections. The ordinary one runs 64 tests; a second one, as `CLUT_PROXY[CORE_LOCKS]`, runs the 5 proxy tests. It derives that second connect string from the first, so the command above is still the whole thing; pass `-x` to give it explicitly, or `--no-proxy` to skip it and be told on stdout that `PROXY_USER` went untested.
+
+`SYS_CONTEXT('USERENV', 'PROXY_USER')` is fixed when a session connects and can never be set from inside one, so the proxy suite is tagged `proxy` and excluded from `run.sql`. Left in, it would fail on every ordinary run for the connection's reason rather than the product's, and the usual answer to that is `%disabled`, which is a test that never runs again. `run_proxy.sql` asks for the tag by name and raises when it finds fewer tests than the suite declares, so a tag that stops matching is loud instead of quiet.
+
+The concurrency suite needs no second connection. It hands its work to a `DBMS_SCHEDULER` job, which runs in a slave session with its own SID and its own transaction, so a lock really does have to cross between two sessions to be seen.
+
 ### Give the suite a schema of its own
 
 `core_locksmith` is an `AFTER DDL ON SCHEMA` trigger, so it governs every `CREATE`, `ALTER` and `DROP` in whatever schema it lives in. Install it beside other work and that work inherits it, and if `core_lock` ever goes invalid its `WHEN OTHERS` handler raises and no DDL in that schema succeeds until somebody drops the trigger. So the suite gets a throwaway schema and nothing else shares it.
 
 The two scheduler jobs are not installed by `install.sql`. `CORE_LOCKSMITH_ENABLE` re-enables the trigger every five minutes, and the unit suite switches it off while it compiles its probes, so the job would switch it back on mid-run.
 
-### Both suites own their own cleanup
+### Every suite owns its own cleanup
 
-`create_lock`, `extend_lock`, `unlock` and `purge_locks` all carry `PRAGMA AUTONOMOUS_TRANSACTION` and commit inside themselves, and the trigger suite runs DDL, which commits too. There is no savepoint left for utPLSQL to roll back to, so both suites declare `%rollback(manual)`, the fixture commits on purpose, and cleanup is the suite's job. `after_each` tears down, counts what survived, and asserts that the count is zero and that teardown recorded no error. A teardown that swallows its failure is the appearance of cleanup, and with committed fixtures the leftovers are permanent.
+`create_lock`, `extend_lock`, `unlock` and `purge_locks` all carry `PRAGMA AUTONOMOUS_TRANSACTION` and commit inside themselves, and the trigger suite runs DDL, which commits too. There is no savepoint left for utPLSQL to roll back to, so every suite declares `%rollback(manual)`, the fixture commits on purpose, and cleanup is the suite's job. `after_each` tears down, counts what survived, and asserts that the count is zero and that teardown recorded no error. A teardown that swallows its failure is the appearance of cleanup, and with committed fixtures the leftovers are permanent.
+
+The concurrency suite adds scheduler jobs to that count. A racer left behind does not sit still: its start time arrives during somebody else's test and it takes a lock nobody asked for.
+
+### One holder, measured rather than guaranteed
+
+`create_lock` reads the lock history and then inserts, with nothing serialising the two. The race test releases four sessions at one shared start time rather than launching them one after another, since four calls in sequence is not a race and would pass whatever the code did about simultaneity. Measured on 26ai across six runs of four to six sessions, exactly one holder every time, the rest refused. That is an outcome, not a promise the code makes, and it is written down here so nobody reads the green as a serialisation guarantee.
+
+The test asserts how many racers actually ran before it asserts anything about the result, because one holder is also what an empty table looks like, and a race that never started reads exactly like a guard that worked.
 
 ### Every test has been seen red
 
-Green proves a suite runs; only red proves it asserts. Each of the 60 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, and so on for 53 separate breakages across two sweeps. Every one of them was caught, and every test died to at least one.
+Green proves a suite runs; only red proves it asserts. Each of the 69 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, the proxy user's place at the top of the ownership ladder, and the history read that would stop seeing other sessions if it were scoped to this one. Fifty-eight separate breakages across three sweeps, every one of them caught, and every test died to at least one.
+
+The proxy suite's first test is the exception that proves the rest of it: it asserts the connection really is a proxy connection, so no product mutation can kill it. Its red comes from the other direction, by running the suite on an ordinary connection, where all five fail. Without it, the four that matter would pass on a database with no proxy in it by falling through the ladder to whatever the session happened to offer.
 
 That discipline found two tests that could not fail as first written. One compared a hand-booked lock against a compiled one using probe source whose `CREATE` header was already spelled the way the dictionary spells it, so the two texts matched with the header left on and the strip stopped mattering. The probe headers are lower case and doubly spaced now, which is what a developer actually types and what normalisation cannot close. The other checked the self-exclusion rule by recompiling the trigger itself, and Oracle does not fire a schema DDL trigger for DDL on that same trigger, so the assertion never had anything to be wrong about.
 
@@ -428,3 +449,9 @@ It also found two product bugs, both in behaviour the code claimed to have. A `D
 85.2% across 908 lines of `core_lock` and `core_locksmith`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
 
 `core_locksmith` itself reports zero covered lines whatever the suite does, because the profiler does not instrument a DDL trigger. The 14 tests in the trigger suite drive it through real compiles, and the mutation sweep breaks it on purpose, which is the only evidence that it runs at all.
+
+Measured over the 64 tests of the ordinary connection. A coverage runner that selects by suite name has to name the three non-proxy suites, since the proxy suite cannot pass on the connection a coverage run makes:
+
+```
+adtai ut -schema CORE_LOCKS -name CORE_LOCK_UT,CORE_LOCKSMITH_UT,CORE_LOCK_CONC_UT -refresh -compact
+```
