@@ -47,7 +47,7 @@ GRANT EXECUTE ON dbms_crypto TO <schema>;      -- SHA-256 source hashing
 GRANT EXECUTE ON dbms_scheduler TO <schema>;   -- the locksmith enable job
 ```
 
-`APEX_STRING` must be reachable; `get_object` uses `APEX_STRING.SPLIT_CLOBS` to normalize the captured DDL. `DBMS_OUTPUT` is used by `unlock` for feedback.
+`APEX_STRING` must be reachable; `get_object` uses `APEX_STRING.SPLIT_CLOBS` to normalize the captured DDL. `DBMS_OUTPUT` is used by `unlock` for feedback, and `DBMS_SQL` reads a view's query text out of its LONG column; both are granted to `PUBLIC` on a stock database, so neither costs you a privilege.
 
 Every developer should reach the schema under an identifiable name, because a lock is only useful when you know who to call about it. Sessions that offer no name fall back to their IP address, and the `core_locksmith` trigger refuses the DDL when there is not even that. Setting this up has its own section: [Proxy Users & Startup Script](#4-proxy-users--startup-script).
 
@@ -226,7 +226,7 @@ Every candidate passes through `core_lock.clean_user` first. That strips a trail
 
 `core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it first refuses the statement outright when `core_lock.get_user()` comes back NULL, which means a session that offered no proxy user, no usable identifier, no history for its workstation, no APEX user, no operating system login and no IP address (see [The IP fallback](#the-ip-fallback)), and then calls `core_lock.create_lock`.
 
-`create_lock` captures the statement's own text through `ora_sql_txt`, normalizes the first and last line so the same source compiled by different clients hashes identically, and skips `ALTER ... COMPILE` entirely – recompiling is not a change. Source-bearing object types are hashed with SHA-256.
+`create_lock` captures the statement's own text through `ora_sql_txt` and keeps it as the backup, and skips `ALTER ... COMPILE` entirely – recompiling is not a change. Source-bearing object types are then hashed with SHA-256, and what gets hashed is the object **without its CREATE header**. That header is the one part of the text nobody writes the same way twice, so dropping it is what makes two fingerprints of the same object comparable. See [Create lock](#create-lock) for why that matters the moment you take a lock by hand.
 
 It then reads the most recent lock row for that object and decides:
 
@@ -263,9 +263,14 @@ core_lock.create_lock (
 );
 ```
 
-Called by hand there is no DDL statement to copy, so the source backup and its hash come from `DBMS_METADATA.GET_DDL` instead. That needs no grant for your own objects and covers every type in one call, which `user_views.text` and `user_triggers.trigger_body` cannot: both are LONG columns, and no SQL expression may concatenate one. An object the dictionary has nothing for is still locked, just without a backup.
+Called by hand there is no DDL statement to copy, so the backup is rebuilt from the dictionary instead. `user_source` holds it for packages, package bodies, procedures, functions and triggers, exactly as the developer typed it after `CREATE OR REPLACE`, so putting that prefix back gives the compiled statement character for character. A view's query comes out of `user_views` under a canonical header. Anything else, a table being the usual one, falls back to `DBMS_METADATA.GET_DDL`. An object the dictionary has nothing for is still locked, just without a backup.
 
-One thing to know about the hash when you mix the two. The trigger stores the statement a developer compiled; a lock taken by hand stores what `GET_DDL` prints, and the two are not the same text. Measured on Oracle 26ai for one package body: 101 characters from the trigger, 128 from the dictionary, and two different hashes. So the next compile inside the one-minute takeover window can read as `LOCK_HASH_ERROR` when nothing changed. Compile the object once, unchanged, and the row is right again, which is what the hash check asks you to do anyway.
+**A lock booked by hand and a lock taken by a compile fingerprint the same object identically.** That is the whole point, and it is not free, because the two sources disagree about the header and about nothing else: the dictionary quotes and schema qualifies the name, adds `EDITIONABLE`, prints a view's column list, and drops a `FORCE` in front of it. So the hash is taken from the body, with the `CREATE ... AS` header removed, and a view loses everything through its first standalone `AS`, since `user_views` never stored a header at all. Measured on Oracle 26ai across all six source-bearing types: hand-lock after a compile, hand-lock then compile, both clean, and a genuine edit by somebody else still refused.
+
+Two traps are worth naming, because both of them look like the code working:
+
+- **`GET_DDL` reprints, it does not repeat.** Asked for a `PACKAGE` it hands back the spec *and* the body; asked for a `TRIGGER` it appends an `ALTER TRIGGER ... ENABLE`. Neither of those is the object you locked, which is why the dictionary's own source columns come first now.
+- **`create_lock` is autonomous, so it cannot see the DDL that is calling it.** Inside an `AFTER DDL` trigger the compile has not committed yet, so a dictionary read there returns the *previous* version of the object. The trigger therefore hashes the statement it was handed, never the dictionary. Get that backwards and every lock quietly records the version it just overwrote.
 
 ### Unlock
 

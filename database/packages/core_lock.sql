@@ -23,6 +23,22 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
 
+    FUNCTION source_object (
+        in_object_type      core_locks.object_type%TYPE,
+        in_object_name      core_locks.object_name%TYPE
+    )
+    RETURN CLOB;
+
+
+
+    FUNCTION object_body (
+        in_object_type      core_locks.object_type%TYPE,
+        in_payload          CLOB
+    )
+    RETURN CLOB;
+
+
+
     PROCEDURE raise_error (
         in_message          VARCHAR2 := NULL
     )
@@ -210,9 +226,16 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
             RETURN;
         END IF;
 
-        -- check hash only on objects with source code
+        -- check hash only on objects with source code.
+        --
+        -- Hash the body, never the whole statement. The trigger sees the statement a
+        -- developer compiled and a lock taken by hand sees the dictionary's copy, and
+        -- their first lines never match: one is what somebody typed, the other adds
+        -- EDITIONABLE, quotes and schema qualifies the name, and prints a view's
+        -- column list. Everything after that first line is the same text in both, so
+        -- object_body drops the CREATE header and what is left compares
         IF in_object_type IN ('PACKAGE', 'PACKAGE BODY', 'PROCEDURE', 'FUNCTION', 'TRIGGER', 'VIEW') THEN
-            rec.object_hash := get_clob_hash(rec.object_payload);
+            rec.object_hash := get_clob_hash(object_body(in_object_type, rec.object_payload));
         END IF;
         --
         IF (NOT g_check_hash OR rec.object_hash IS NULL) THEN
@@ -293,11 +316,11 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
     --
-    -- The object a lock row is about, re-read for an extend. The row knows the type
-    -- and the name, so an extend called by hand refreshes the backup exactly like
-    -- one driven from the trigger instead of reading an empty statement
+    -- The source of the object a lock row is about, re-read for an extend. The row
+    -- knows the type and the name, so an extend called by hand refreshes the backup
+    -- exactly like one driven from the trigger instead of reading an empty statement
     --
-    FUNCTION lock_source (
+    FUNCTION get_lock_payload (
         in_lock_id          core_locks.lock_id%TYPE
     )
     RETURN CLOB
@@ -319,6 +342,32 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
 
+    --
+    -- The fingerprint of that same payload, taken the way create_lock takes it, so an
+    -- extend writes a hash the next compile can actually compare against
+    --
+    FUNCTION get_lock_hash (
+        in_lock_id          core_locks.lock_id%TYPE,
+        in_payload          CLOB
+    )
+    RETURN VARCHAR2
+    AS
+        v_out           VARCHAR2(128);
+    BEGIN
+        FOR c IN (
+            SELECT
+                t.object_type
+            FROM core_locks t
+            WHERE t.lock_id     = in_lock_id
+        ) LOOP
+            v_out := get_clob_hash(object_body(c.object_type, in_payload));
+        END LOOP;
+        --
+        RETURN v_out;
+    END;
+
+
+
     PROCEDURE extend_lock (
         in_lock_id          core_locks.lock_id%TYPE,
         in_time             NUMBER
@@ -329,8 +378,8 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         rec                 core_locks%ROWTYPE;
     BEGIN
         rec.expire_at       := SYSDATE + NVL(in_time, g_lock_length);
-        rec.object_payload  := lock_source(in_lock_id);
-        rec.object_hash     := get_clob_hash(rec.object_payload);
+        rec.object_payload  := get_lock_payload(in_lock_id);
+        rec.object_hash     := get_lock_hash(in_lock_id, rec.object_payload);
         --
         UPDATE core_locks t
         SET t.counter           = NVL(t.counter, 0) + 1,
@@ -362,8 +411,8 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         rec                 core_locks%ROWTYPE;
     BEGIN
         rec.expire_at       := NVL(in_expire_at, SYSDATE + g_lock_length);
-        rec.object_payload  := lock_source(in_lock_id);
-        rec.object_hash     := get_clob_hash(rec.object_payload);
+        rec.object_payload  := get_lock_payload(in_lock_id);
+        rec.object_hash     := get_lock_hash(in_lock_id, rec.object_payload);
         --
         UPDATE core_locks t
         SET t.counter           = NVL(t.counter, 0) + 1,
@@ -504,12 +553,192 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
 
 
     --
+    -- A view's query text, which is a LONG. No SQL expression may concatenate one,
+    -- and a SELECT INTO caps at the PL/SQL varchar limit, so a big reporting view
+    -- would lose its fingerprint exactly where a lock is worth the most. DBMS_SQL
+    -- reads a LONG in chunks and has no such ceiling. It is granted to PUBLIC, so
+    -- this costs no extra privilege
+    --
+    FUNCTION view_query (
+        in_object_name      core_locks.object_name%TYPE
+    )
+    RETURN CLOB
+    AS
+        v_cursor        PLS_INTEGER := DBMS_SQL.OPEN_CURSOR;
+        v_ignore        PLS_INTEGER;
+        v_chunk         VARCHAR2(32767);
+        v_read          PLS_INTEGER;
+        v_offset        PLS_INTEGER := 0;
+        v_out           CLOB;
+    BEGIN
+        DBMS_SQL.PARSE(v_cursor, 'SELECT t.text FROM user_views t WHERE t.view_name = :n', DBMS_SQL.NATIVE);
+        DBMS_SQL.BIND_VARIABLE(v_cursor, ':n', in_object_name);
+        DBMS_SQL.DEFINE_COLUMN_LONG(v_cursor, 1);
+        --
+        v_ignore := DBMS_SQL.EXECUTE(v_cursor);
+        --
+        IF DBMS_SQL.FETCH_ROWS(v_cursor) > 0 THEN
+            LOOP
+                DBMS_SQL.COLUMN_VALUE_LONG(v_cursor, 1, 32767, v_offset, v_chunk, v_read);
+                EXIT WHEN NVL(v_read, 0) = 0;
+                --
+                v_out       := v_out || SUBSTR(v_chunk, 1, v_read);
+                v_offset    := v_offset + v_read;
+            END LOOP;
+        END IF;
+        --
+        DBMS_SQL.CLOSE_CURSOR(v_cursor);
+        --
+        RETURN v_out;
+    EXCEPTION
+    WHEN OTHERS THEN
+        IF DBMS_SQL.IS_OPEN(v_cursor) THEN
+            DBMS_SQL.CLOSE_CURSOR(v_cursor);
+        END IF;
+        --
+        RETURN NULL;
+    END;
+
+
+
+    --
+    -- The object as the dictionary itself holds it, rebuilt into the statement that
+    -- would create it. This is the one text a hash is ever taken from, whichever way
+    -- the lock was opened, which is what lets a lock taken by hand and a lock taken
+    -- by a compile fingerprint the same object identically.
+    --
+    -- user_source carries all five PL/SQL types, triggers included, and it stores
+    -- what the developer actually typed after CREATE OR REPLACE, so putting that
+    -- prefix back reproduces the compiled statement character for character. Views
+    -- keep their query text and get a canonical header instead, since no two clients
+    -- write that header the same way. An object the dictionary has nothing for
+    -- answers NULL, and a lock is still taken, just without a fingerprint
+    --
+    FUNCTION source_object (
+        in_object_type      core_locks.object_type%TYPE,
+        in_object_name      core_locks.object_name%TYPE
+    )
+    RETURN CLOB
+    AS
+        v_out           CLOB;
+    BEGIN
+        IF in_object_type = 'VIEW' THEN
+            v_out := view_query(in_object_name);
+            --
+            IF v_out IS NULL THEN
+                RETURN NULL;
+            END IF;
+            --
+            RETURN 'CREATE OR REPLACE VIEW ' || in_object_name || ' AS' || CHR(10) || v_out;
+        END IF;
+        --
+        FOR c IN (
+            SELECT
+                t.text
+            FROM user_source t
+            WHERE t.name        = in_object_name
+                AND t.type      = in_object_type
+            ORDER BY
+                t.line
+        ) LOOP
+            v_out := v_out || c.text;
+        END LOOP;
+        --
+        IF v_out IS NULL THEN
+            RETURN NULL;
+        END IF;
+        --
+        RETURN 'CREATE OR REPLACE ' || v_out;
+    EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+    END;
+
+
+
+    --
+    -- The object without its CREATE header, which is the only text worth hashing.
+    --
+    -- Two things write a payload here and they disagree on that header and on nothing
+    -- else. The trigger keeps the statement a developer typed; a lock taken by hand
+    -- rebuilds one from the dictionary, which uppercases nothing, quotes the name and
+    -- prints a view's column list. Drop the header and the two agree character for
+    -- character, which is what lets a lock booked by hand and a lock taken by a
+    -- compile talk about the same object.
+    --
+    -- The header is always the first line, so this walks lines rather than cutting the
+    -- CLOB: SUBSTR over a CLOB comes back as a varchar and would silently truncate a
+    -- package at 32k. A view loses everything through its first standalone AS, since
+    -- the dictionary keeps only the query text; anything else loses the CREATE, the
+    -- optional OR REPLACE, and the EDITIONABLE and FORCE that only the dictionary adds
+    --
+    FUNCTION object_body (
+        in_object_type      core_locks.object_type%TYPE,
+        in_payload          CLOB
+    )
+    RETURN CLOB
+    AS
+        v_out           CLOB;
+        v_line          CLOB;
+    BEGIN
+        IF in_payload IS NULL THEN
+            RETURN NULL;
+        END IF;
+        --
+        FOR c IN (
+            SELECT
+                t.column_value,
+                ROWNUM AS r#
+            FROM TABLE(APEX_STRING.SPLIT_CLOBS(
+                p_str => in_payload,
+                p_sep => CHR(10)
+            )) t
+        ) LOOP
+            v_line := c.column_value;
+            --
+            IF c.r# = 1 THEN
+                IF in_object_type IN ('VIEW', 'MATERIALIZED VIEW') THEN
+                    v_line  := REGEXP_REPLACE(v_line, '^.*?\sAS\s|^.*?\sAS$', '', 1, 1, 'i');
+                ELSE
+                    v_line  := REGEXP_REPLACE(v_line, '^\s*CREATE\s+(OR\s+REPLACE\s+)?((NON)?EDITIONABLE\s+)?(FORCE\s+)?', '', 1, 1, 'i');
+                END IF;
+            END IF;
+            --
+            v_out := v_out || v_line || CHR(10);
+        END LOOP;
+
+        -- a header written on its own line leaves an empty one behind, and a header
+        -- sharing the line with the body does not, so drop the leading whitespace
+        -- instead of letting the developer's line breaks decide the hash
+        v_out := LTRIM(v_out, CHR(10) || CHR(13) || CHR(9) || ' ');
+        v_out := RTRIM(v_out, CHR(10) || CHR(13) || CHR(9) || ' ');
+
+        -- and drop the trailing terminator, which is the client's punctuation rather
+        -- than the object's source. SQL*Plus hands over a statement ending in a
+        -- newline and the dictionary's copy ends on the END, so a rule that reads the
+        -- last LINE gets a different answer for the same object depending on who
+        -- compiled it. Reading the last CHARACTER of the whole text does not.
+        -- DBMS_LOB rather than SUBSTR, which would cut a big package down to a varchar
+        IF NVL(LENGTH(v_out), 0) > 0
+            AND NOT REGEXP_LIKE(DBMS_LOB.SUBSTR(v_out, 1, LENGTH(v_out)), '[[:alnum:]_]')
+        THEN
+            DBMS_LOB.TRIM(v_out, LENGTH(v_out) - 1);
+        END IF;
+        --
+        RETURN v_out;
+    END;
+
+
+
+    --
     -- The object as the dictionary holds it, for a lock taken outside the DDL trigger
-    -- where there is no statement to read. DBMS_METADATA covers every type in one
-    -- call and returns a CLOB, which user_views.text and user_triggers.trigger_body
-    -- cannot: both are LONG and no SQL expression may concatenate one. It needs no
-    -- grant for the caller's own objects, and an object that is not there raises
-    -- ORA-31603, which answers NULL and locks without a backup
+    -- where there is no statement to read. The dictionary's own source comes first,
+    -- because DBMS_METADATA reprints rather than repeats: asked for a PACKAGE it
+    -- hands back the spec AND the body, asked for a TRIGGER it appends an ALTER
+    -- TRIGGER ... ENABLE, and neither of those is the object you locked. It stays as
+    -- the fallback for the types user_source and user_views cannot answer, a table
+    -- among them. It needs no grant for the caller's own objects, and an object that
+    -- is not there raises ORA-31603, which answers NULL and locks without a backup
     --
     FUNCTION dict_object (
         in_object_type      core_locks.object_type%TYPE,
@@ -517,7 +746,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
     )
     RETURN CLOB
     AS
+        v_out           CLOB := source_object(in_object_type, in_object_name);
     BEGIN
+        IF v_out IS NOT NULL THEN
+            RETURN v_out;
+        END IF;
+        --
         -- the metadata API spells a two-word type with an underscore
         RETURN DBMS_METADATA.GET_DDL(REPLACE(in_object_type, ' ', '_'), in_object_name);
     EXCEPTION
@@ -553,6 +787,12 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
             v_temp := NULL;
         END;
 
+        -- ora_sql_txt hands the statement over in 64 byte chunks and the last one
+        -- carries a C string terminator on the end. That is transport noise, not
+        -- source, and it is what the old last-line rule was really removing, which is
+        -- also why nobody noticed the rule eating a real character everywhere else
+        v_temp := REPLACE(v_temp, CHR(0));
+
         -- no statement means this was called by hand, so ask the dictionary instead
         IF v_temp IS NULL AND in_object_name IS NOT NULL THEN
             v_temp := dict_object(in_object_type, in_object_name);
@@ -583,11 +823,15 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
                 END IF;
             END IF;
 
-            -- fix wrong last line
-            IF c.r# = c.total# THEN
-                c.column_value := REGEXP_REPLACE(c.column_value, '[^\w]$', '');
-            END IF;
-            --
+            -- the last line used to be stripped here, to drop the terminator a client
+            -- may or may not send. It was written REGEXP_REPLACE(line, '[^\w]$', '')
+            -- and Oracle reads \w as the plain letter, so the class matched everything
+            -- except w and a backslash and ate the last real character: measured on
+            -- 26ai, "dual" came back as "dua" and "ENABLE" as "ENABL". It was invisible
+            -- because a statement ending in a newline splits into an empty last line
+            -- and the strip landed on that instead of on the source. The payload is a
+            -- backup and gets to keep every character it arrived with; the terminator
+            -- is normalized in object_body, where the comparing is done
             v_out := v_out || c.column_value || CHR(10);
             --
             v_rows := c.total#;
