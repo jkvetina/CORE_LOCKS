@@ -1,0 +1,25 @@
+# utPLSQL lint configuration for CORE_LOCKS.
+#
+#     python3 <brain>/AI/SKILLS/DEVOPS/plsql-unit-test/scripts/ut_lint.py
+#
+# Run from anywhere inside the repo, the linter walks up to find this file.
+
+[paths]
+tests  = ["database/tests"]
+source = ["database/packages"]
+ddl    = ["database/tables"]
+
+[conventions]
+test_suffix = "_ut"
+
+# core_lock is the catalogue: it declares app_exception and c_app_exception_code,
+# and every raise in the feature goes through core_lock.raise_error. There is only
+# the one code (-20990) and the specific failure is carried in the message
+# prefix, so a %throws pins that the call raised at all, and the tests that care which
+# error it was assert on the message instead.
+error_catalogue = "core_lock"
+
+suitepath_root = "core_locks"
+
+[gate]
+strict = false

@@ -16,6 +16,7 @@
 6. [API Reference](#6-api-reference)
 7. [Configuration](#7-configuration)
 8. [Operational Notes](#8-operational-notes)
+9. [Tests](#9-tests)
 
 ---
 
@@ -378,3 +379,46 @@ ALTER TABLE core_locks ENABLE ROW MOVEMENT;
 ALTER TABLE core_locks SHRINK SPACE CASCADE;
 ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 ```
+
+---
+
+## 9. Tests
+
+There are 42 utPLSQL tests in two suites, and they cover every public routine in `core_lock` plus the `core_locksmith` trigger.
+
+| File | What it holds |
+| --- | --- |
+| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 35 tests |
+| `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 7 tests |
+| `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, teardown ledger |
+| `database/tests/create_test_user.sql` | Creates the throwaway schema, run as SYSDBA |
+| `database/tests/install.sql` | Installs product and suites, then proves the install |
+| `database/tests/run.sql` | Runs everything and fails the session when it is not green |
+| `database/tests/run.sh` | Does both of the above from any working directory |
+
+You need utPLSQL v3 (measured against v3.2.3.4508 on 23ai) and the same `APEX_STRING` and `DBMS_CRYPTO` access the feature itself needs.
+
+```
+sqlplus "sys/<password>@<host>:<port>/<service> as sysdba" @database/tests/create_test_user.sql
+database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service>
+```
+
+### Give the suite a schema of its own
+
+`core_locksmith` is an `AFTER DDL ON SCHEMA` trigger, so it governs every `CREATE`, `ALTER` and `DROP` in whatever schema it lives in. Install it beside other work and that work inherits it, and if `core_lock` ever goes invalid its `WHEN OTHERS` handler raises and no DDL in that schema succeeds until somebody drops the trigger. So the suite gets a throwaway schema and nothing else shares it.
+
+The two scheduler jobs are not installed by `install.sql`. `CORE_LOCKSMITH_ENABLE` re-enables the trigger every five minutes, and the unit suite switches it off while it compiles its probes, so the job would switch it back on mid-run.
+
+### Both suites own their own cleanup
+
+`create_lock`, `extend_lock`, `unlock` and `purge_locks` all carry `PRAGMA AUTONOMOUS_TRANSACTION` and commit inside themselves, and the trigger suite runs DDL, which commits too. There is no savepoint left for utPLSQL to roll back to, so both suites declare `%rollback(manual)`, the fixture commits on purpose, and cleanup is the suite's job. `after_each` tears down, counts what survived, and asserts that the count is zero and that teardown recorded no error. A teardown that swallows its failure is the appearance of cleanup, and with committed fixtures the leftovers are permanent.
+
+### Every test has been seen red
+
+Green proves a suite runs; only red proves it asserts. Each of the 42 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, the retention window in `purge_locks`, the name and type filters in the trigger, and so on for 36 separate breakages. Every one of them was caught, and every test died to at least one.
+
+That discipline found two tests that could not fail as first written. One compared a hand-booked lock against a compiled one using probe source whose `CREATE` header was already spelled the way the dictionary spells it, so the two texts matched with the header left on and the strip stopped mattering. The probe headers are lower case and doubly spaced now, which is what a developer actually types and what normalisation cannot close. The other checked the self-exclusion rule by recompiling the trigger itself, and Oracle does not fire a schema DDL trigger for DDL on that same trigger, so the assertion never had anything to be wrong about.
+
+### Coverage
+
+83.2% across 867 lines of `core_lock` and `core_locksmith`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
