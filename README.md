@@ -386,35 +386,56 @@ ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 
 ## 9. Tests
 
-There are 69 utPLSQL tests in four suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the two things one session cannot show about itself: a lock seen from another session, and an owner the database vouched for.
+There are 77 utPLSQL tests in five suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the three things one session cannot show about itself: a lock seen from another session, an owner the database vouched for, and a session with no name at all.
 
 | File | What it holds |
 | --- | --- |
-| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 46 tests |
-| `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 14 tests |
+| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 49 tests |
+| `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 15 tests |
 | `database/tests/core_lock_conc_ut.spec.sql` / `.sql` | Two sessions at once, borrowed from the scheduler. 4 tests |
 | `database/tests/core_lock_proxy_ut.spec.sql` / `.sql` | Ownership through a proxy connection. 5 tests |
+| `database/tests/core_lock_anon_ut.spec.sql` / `.sql` | The refusal of a session that names nobody. 4 tests |
 | `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, second sessions, teardown ledger |
 | `database/tests/create_test_user.sql` | Creates the throwaway schema and its proxy account, run as SYSDBA |
 | `database/tests/install.sql` | Installs product and suites, then proves the install |
-| `database/tests/run.sql` | Runs everything except the proxy tag, and fails the session when it is not green |
+| `database/tests/run.sql` | Runs everything except the `proxy` and `anon` tags, and fails the session when it is not green |
 | `database/tests/run_proxy.sql` | Runs the proxy tag, and refuses a connection that has no proxy user |
+| `database/tests/run_anon.sql` | Runs the anon tag, and refuses a connection that has an address |
+| `database/tests/run_anon.sh` | Reaches a local connection inside the database's container |
 | `database/tests/run.sh` | Does all of the above from any working directory |
 
 You need utPLSQL v3 (measured against v3.2.3.4508 on 23ai) and the same `APEX_STRING` and `DBMS_CRYPTO` access the feature itself needs.
 
 ```
 sqlplus "sys/<password>@<host>:<port>/<service> as sysdba" @database/tests/create_test_user.sql
-database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service>
+database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service> --anon
 ```
 
-### Two connections, because two of the tests cannot be faked
+### Three connections, because three of the tests cannot be faked
 
-`run.sh` makes two connections. The ordinary one runs 64 tests; a second one, as `CLUT_PROXY[CORE_LOCKS]`, runs the 5 proxy tests. It derives that second connect string from the first, so the command above is still the whole thing; pass `-x` to give it explicitly, or `--no-proxy` to skip it and be told on stdout that `PROXY_USER` went untested.
+`run.sh` makes up to three connections, because what two of the suites test is decided when a session connects and can never be arranged from inside one.
 
-`SYS_CONTEXT('USERENV', 'PROXY_USER')` is fixed when a session connects and can never be set from inside one, so the proxy suite is tagged `proxy` and excluded from `run.sql`. Left in, it would fail on every ordinary run for the connection's reason rather than the product's, and the usual answer to that is `%disabled`, which is a test that never runs again. `run_proxy.sql` asks for the tag by name and raises when it finds fewer tests than the suite declares, so a tag that stops matching is loud instead of quiet.
+| Connection | Suites | Tests | Why it has to be its own connection |
+| --- | --- | --- | --- |
+| ordinary | unit, trigger, concurrency | 68 | it is the plain connection everything else is measured against |
+| `CLUT_PROXY[CORE_LOCKS]` | proxy | 5 | `PROXY_USER` is fixed at connect time |
+| local IPC, inside the host | anon | 4 | only a connection with no IP address resolves to nobody |
+
+The proxy connect string is derived from the first, so the command above is still the whole thing; pass `-x` to give it explicitly, or `--no-proxy` to skip it and be told on stdout that `PROXY_USER` went untested.
+
+The anon run is opt-in rather than opt-out, because it needs a shell on the database host and the ordinary caller of `run.sh` does not have one. Without `--anon` it says so on stdout for the same reason `--no-proxy` does. `--anon [container]` delegates to `run_anon.sh`, which steps inside the container and connects over IPC; the SQL arrives on stdin rather than as an `@` path, since the repository is not mounted in there and a script the container cannot open looks exactly like an empty green run.
+
+Both suites are tagged out of `run.sql` rather than left out of the install. Left in, they would fail on every ordinary run for the connection's reason rather than the product's, and the usual answer to that is `%disabled`, which is a test that never runs again. `run_proxy.sql` and `run_anon.sql` ask for their tag by name and raise when they find fewer tests than the suite declares, so a tag that stops matching is loud instead of quiet.
 
 The concurrency suite needs no second connection. It hands its work to a `DBMS_SCHEDULER` job, which runs in a slave session with its own SID and its own transaction, so a lock really does have to cross between two sessions to be seen.
+
+### The anonymous session, and why it takes a third connection
+
+`get_user` ends its ladder on `SYS_CONTEXT('USERENV', 'IP_ADDRESS')`, so any session reached over TCP resolves to something and the refusal of an anonymous session is unreachable from one. A local IPC or bequeath connection carries no address at all, and the OS user behind it is the database's own service account, which `clean_user` reduces to nobody like any other pool account. That is the only connection on which the guard can fire.
+
+utPLSQL sets the client identifier to the name of the test it is about to run, which is the second rung of that same ladder. A session stripped in `before_each` is therefore named again (after the anon suite's own test, of all things) before the body starts, so each test here strips the session as its first statement instead.
+
+Two things enforce the anonymous rule, not one: `create_lock` checks its resolved owner, and the trigger checks earlier so the error arrives before an autonomous transaction opens. Removing either one on its own changes nothing observable, which the mutation sweep confirms. `core_locks.locked_by` is `NOT NULL`, so with both removed the insert fails and the compile is still refused under the same catalogue code. That is why both refusal tests assert the message and not just the code.
 
 ### Give the suite a schema of its own
 
@@ -436,7 +457,9 @@ The test asserts how many racers actually ran before it asserts anything about t
 
 ### Every test has been seen red
 
-Green proves a suite runs; only red proves it asserts. Each of the 69 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, the proxy user's place at the top of the ownership ladder, and the history read that would stop seeing other sessions if it were scoped to this one. Fifty-eight separate breakages across three sweeps, every one of them caught, and every test died to at least one.
+Green proves a suite runs; only red proves it asserts. Each of the 77 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, the proxy user's place at the top of the ownership ladder, the lock row an extend reads its payload from, and the history read that would stop seeing other sessions if it were scoped to this one. Sixty-six separate breakages across four sweeps, every one of them caught, and every test died to at least one.
+
+A mutation is anchored on the text around it and asserts how many places it expects to match. `extend_lock`'s two overloads carry byte-identical `UPDATE` bodies, so an unanchored find-and-replace hits the first one, leaves the overload under test untouched, and reports a surviving mutant that reads exactly like a coverage hole.
 
 The proxy suite's first test is the exception that proves the rest of it: it asserts the connection really is a proxy connection, so no product mutation can kill it. Its red comes from the other direction, by running the suite on an ordinary connection, where all five fail. Without it, the four that matter would pass on a database with no proxy in it by falling through the ladder to whatever the session happened to offer.
 
@@ -446,12 +469,22 @@ It also found two product bugs, both in behaviour the code claimed to have. A `D
 
 ### Coverage
 
-85.2% across 908 lines of `core_lock` and `core_locksmith`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
+85.2% across 908 lines of `core_lock`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
 
-`core_locksmith` itself reports zero covered lines whatever the suite does, because the profiler does not instrument a DDL trigger. The 14 tests in the trigger suite drive it through real compiles, and the mutation sweep breaks it on purpose, which is the only evidence that it runs at all.
+`core_locksmith` contributes no lines to that denominator at all, because the profiler does not instrument a DDL trigger, so the tool reports it with a blank line count rather than a low percentage. The 15 tests in the trigger suite drive it through real compiles, and the mutation sweep breaks it on purpose, which is the only evidence that it runs at all. It is also why the tests added for the trigger's own branches move the number by nothing: those lines were never being counted.
 
-Measured over the 64 tests of the ordinary connection. A coverage runner that selects by suite name has to name the three non-proxy suites, since the proxy suite cannot pass on the connection a coverage run makes:
+Measured over the 68 tests of the ordinary connection. A coverage runner that selects by suite name has to name the three suites that connection can reach, since neither the proxy suite nor the anon suite can pass on the connection a coverage run makes:
 
 ```
 adtai ut -schema CORE_LOCKS -name CORE_LOCK_UT,CORE_LOCKSMITH_UT,CORE_LOCK_CONC_UT -refresh -compact
 ```
+
+### Continuous integration
+
+`.github/workflows/tests.yml` runs the whole thing (all three connections) on every push and pull request.
+
+It runs on a self-hosted macOS runner rather than a GitHub-hosted one, and the reason is `APEX_STRING`. A hosted runner would have to stand up Oracle Free and then install APEX into it before a single test could run, which is roughly half an hour of setup in front of a four-second suite; the self-hosted runner talks to a database that already has both. It also makes the anon suite reachable, which needs a shell on the database host.
+
+The workflow names no path on that machine. The connect string defaults to the throwaway one `create_test_user.sql` already documents, and `CORE_LOCKS_SQLPLUS` and `CORE_LOCKS_CONTAINER` are repository variables with defaults, so the runner's own environment decides where `sqlplus` and the container runtime live.
+
+The first step asks the database whether it is open, as its own named step. A database that is down fails every later step anyway, but it fails them as "the tests did not pass", which is the one thing it does not mean.

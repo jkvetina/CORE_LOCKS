@@ -33,6 +33,9 @@ CREATE OR REPLACE PACKAGE core_locksmith_ut AS
     -- %test(an object type outside the tracked list is ignored)
     PROCEDURE test_locksmith#an_untracked_object_type_is_ignored;
 
+    -- %test(an object a dependency scanner left behind is skipped by name)
+    PROCEDURE test_locksmith#a_dependency_scanner_object_is_skipped;
+
     -- %test(a lock booked by hand fingerprints the same object as one taken by a compile)
     PROCEDURE test_locksmith#a_hand_lock_matches_a_compile;
 

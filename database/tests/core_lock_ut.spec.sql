@@ -133,6 +133,15 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
     -- %test(refreshes the fingerprint it will later compare against)
     PROCEDURE test_extend_lock#refreshes_the_fingerprint;
 
+    -- %test(reads the object the lock row names, not whichever was touched last)
+    PROCEDURE test_extend_lock#reads_the_object_the_row_names;
+
+    -- %test(an unchanged view keeps the fingerprint its lock was cut with)
+    PROCEDURE test_extend_lock#a_view_keeps_the_fingerprint_it_was_locked_with;
+
+    -- %test(an object dropped under the lock keeps the last payload and fingerprint)
+    PROCEDURE test_extend_lock#a_dropped_object_keeps_the_last_payload;
+
     -- %test(an explicit interval sets the expiry)
     PROCEDURE test_extend_lock#an_explicit_interval_sets_the_expiry;
 

@@ -1,0 +1,62 @@
+#
+# Run the utPLSQL suites on every push.
+#
+# The job runs on a self-hosted macOS runner rather than a GitHub-hosted one, and
+# the reason is APEX. core_lock splits CLOBs with APEX_STRING, so a hosted runner
+# would have to stand up Oracle Free and then install APEX into it before a single
+# test could run, roughly half an hour of setup in front of a four-second suite.
+# The self-hosted runner talks to a database that already has both.
+#
+# Nothing here names a path on that machine. The connect string is the throwaway
+# one the repository already documents in create_test_user.sql; everything else is
+# a repository variable with a default, so the runner's own environment decides
+# where sqlplus and the container runtime actually live.
+#
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# a second push supersedes the first: the suite talks to one shared database, so
+# two runs at once are two suites deleting each other's lock rows
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  utplsql:
+    runs-on: [self-hosted, core-locks]
+    timeout-minutes: 15
+
+    env:
+      CONNECT: ${{ vars.CORE_LOCKS_CONNECT || 'core_locks/core_locks@localhost:1521/FREEPDB1' }}
+      SQLPLUS: ${{ vars.CORE_LOCKS_SQLPLUS || 'sqlplus' }}
+      ORACLE_CONTAINER: ${{ vars.CORE_LOCKS_CONTAINER || 'local-26ai' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Asked before anything is installed, and asked as its own step so the answer
+      # is legible. A database that is down fails every later step too, but it fails
+      # them as "the tests did not pass", which is the one thing it does not mean.
+      - name: the database is open
+        run: |
+          "$SQLPLUS" -S -L "$CONNECT" <<'SQL'
+          whenever sqlerror exit failure
+          set feedback off pagesize 0
+          SELECT 'DB OPEN: ' || SYS_CONTEXT('USERENV', 'DB_NAME')
+              || ' ' || SYS_CONTEXT('USERENV', 'CON_NAME') FROM dual;
+          EXIT;
+          SQL
+
+      # All three connections, because the ordinary one cannot reach two of the
+      # suites: --anon is what makes the run whole rather than the two thirds of
+      # itself that a plain invocation covers.
+      - name: install and run the suites
+        run: |
+          database/tests/run.sh \
+              -c "$CONNECT" \
+              --sqlplus "$SQLPLUS" \
+              --anon "$ORACLE_CONTAINER"

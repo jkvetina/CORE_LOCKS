@@ -12,6 +12,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
         'FUNCTION',
         'PROCEDURE',
         'OWN',
+        'DEPSCAN',
         'PACKAGE',
         'SEQUENCE',
         'TABLE'
@@ -65,6 +66,17 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
     AS
     BEGIN
         DBMS_SESSION.SET_IDENTIFIER(in_name);
+    END;
+
+
+
+    PROCEDURE act_as_nobody
+    AS
+    BEGIN
+        -- both, because get_user asks both. Clearing the identifier and leaving
+        -- client info behind names the session just as well, one rung further down
+        DBMS_SESSION.CLEAR_IDENTIFIER();
+        DBMS_APPLICATION_INFO.SET_CLIENT_INFO(NULL);
     END;
 
 
@@ -157,6 +169,18 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
                 'END;'
             );
             --
+        WHEN 'DEPSCAN' THEN
+            -- what a dependency scanner leaves behind: a real PROCEDURE, created by
+            -- a real CREATE, differing from the PROCEDURE probe in its name alone.
+            -- Everything the locksmith tracks is satisfied here, so a lock on this
+            -- object means the DEPSCAN$ skip did not run
+            RETURN TO_CLOB (
+                'create  or  replace  procedure ' || LOWER(c_depscan) || ' as' || CHR(10) ||
+                'BEGIN' || CHR(10) ||
+                '    NULL;   -- version ' || v_mark || CHR(10) ||
+                'END;'
+            );
+            --
         WHEN 'MATERIALIZED VIEW' THEN
             RETURN TO_CLOB (
                 'create  materialized  view ' || LOWER(c_mview) || ' as' || CHR(10) ||
@@ -238,15 +262,17 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
                 WHEN 'FUNCTION'             THEN c_fn
                 WHEN 'PROCEDURE'            THEN c_proc
                 WHEN 'OWN'                  THEN c_own
+                WHEN 'DEPSCAN'              THEN c_depscan
                 WHEN 'PACKAGE'              THEN c_pkg
                 WHEN 'SEQUENCE'             THEN c_sequence
                 WHEN 'TABLE'                THEN c_table
             END;
             --
-            -- OWN and BIG VIEW are probe roles, not object types; each is dropped
-            -- as whatever it actually is
+            -- OWN, DEPSCAN and BIG VIEW are probe roles, not object types; each is
+            -- dropped as whatever it actually is
             v_type := CASE c_drop_order(i)
                 WHEN 'OWN'      THEN 'PROCEDURE'
+                WHEN 'DEPSCAN'  THEN 'PROCEDURE'
                 WHEN 'BIG VIEW' THEN 'VIEW'
                 ELSE c_drop_order(i)
             END;
@@ -556,7 +582,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock_fixture AS
         INTO v_left
         FROM user_objects t
         WHERE t.object_name IN (c_pkg, c_proc, c_fn, c_view, c_bigview, c_mview,
-            c_trigger, c_table, c_sequence, c_own);
+            c_trigger, c_table, c_sequence, c_own, c_depscan);
         --
         SELECT COUNT(*)
         INTO v_jobs

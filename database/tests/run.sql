@@ -13,10 +13,15 @@
 --                                  stopped being discovered, and an empty green
 --                                  run is exactly what that looks like
 --
--- The proxy suite is tagged out here rather than left out of the install.
--- PROXY_USER is set when the session connects and cannot be arranged from inside
--- one, so on this connection those tests would be failing for the connection's
--- reason and not the product's. run_proxy.sql runs them through a proxy connection.
+-- Two suites are tagged out here rather than left out of the install, and both for
+-- the same reason: what they test is decided by the connection, so on this one they
+-- would be failing for the connection's sake and not the product's.
+--
+--   proxy   PROXY_USER is set when the session connects and cannot be arranged from
+--           inside one. run_proxy.sql runs it through a proxy connection.
+--   anon    get_user ends on the session's IP address, which every TCP connection
+--           carries, so the refusal of a nameless session is unreachable from here.
+--           run_anon.sql runs it through a local IPC connection.
 --
 set serveroutput on size unlimited
 set lines 200 pages 0 feed off verify off
@@ -32,7 +37,7 @@ DECLARE
 BEGIN
     FOR c IN (
         SELECT column_value AS line
-        FROM TABLE(ut.run(a_tags => '-proxy'))
+        FROM TABLE(ut.run(a_tags => '-proxy,-anon'))
     ) LOOP
         DBMS_OUTPUT.PUT_LINE(c.line);
         --

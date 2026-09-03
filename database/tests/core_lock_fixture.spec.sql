@@ -44,6 +44,14 @@ CREATE OR REPLACE PACKAGE core_lock_fixture AS
     -- the locksmith tracks, so its name is the only reason no lock is taken
     c_own                   CONSTANT VARCHAR2(128) := 'CORE_LOCK_PROBE';
 
+    -- a dependency-scanner object, for the locksmith's other name-based skip. Built
+    -- the same way c_own is and for the same reason: a PROCEDURE created by a
+    -- CREATE, so both the tracked type and the tracked event are satisfied and the
+    -- DEPSCAN$ prefix is the only thing keeping it out of the lock table. It must
+    -- NOT begin with CORE_LOCK, or the self-exclusion would answer first and this
+    -- probe would be proving that rule a second time instead of this one
+    c_depscan               CONSTANT VARCHAR2(128) := 'DEPSCAN$CLUT';
+
     -- the two names the suites act under, so a takeover is a real second person
     c_alice                 CONSTANT VARCHAR2(128) := 'ALICE';
     c_bob                   CONSTANT VARCHAR2(128) := 'BOB';
@@ -83,6 +91,17 @@ CREATE OR REPLACE PACKAGE core_lock_fixture AS
     PROCEDURE act_as (
         in_name             VARCHAR2
     );
+
+
+
+    --
+    -- Take every name off the session, so get_user has to answer from the
+    -- connection alone. The counterpart of act_as and arranged just as explicitly:
+    -- a session that merely has not been named yet looks identical to one that was
+    -- stripped on purpose, and the first survives only until some earlier test
+    -- names it and utPLSQL runs them all in the one session.
+    --
+    PROCEDURE act_as_nobody;
 
 
 

@@ -40,6 +40,8 @@ PROMPT ===== test fixture and suites
 @database/tests/core_lock_conc_ut.sql
 @database/tests/core_lock_proxy_ut.spec.sql
 @database/tests/core_lock_proxy_ut.sql
+@database/tests/core_lock_anon_ut.spec.sql
+@database/tests/core_lock_anon_ut.sql
 
 PROMPT
 PROMPT ===== the locksmith starts enabled, whatever a half-finished run left behind
@@ -87,9 +89,13 @@ PROMPT
 PROMPT Installed. Run the suites with:
 PROMPT     sqlplus core_locks/core_locks@<host>:<port>/<service> @database/tests/run.sql
 PROMPT
-PROMPT The proxy suite is tagged out of that run and needs a proxy connection:
+PROMPT Two suites are tagged out of that run, because what they test is decided by
+PROMPT the connection. The proxy suite needs a proxy connection:
 PROMPT     sqlplus CLUT_PROXY[CORE_LOCKS]/clut_proxy@<host>:<port>/<service> @database/tests/run_proxy.sql
-PROMPT     (run.sh does both)
+PROMPT
+PROMPT and the anon suite needs a local connection with no address, on the database host:
+PROMPT     sqlplus core_locks/core_locks@<local IPC descriptor> @database/tests/run_anon.sql
+PROMPT     (run.sh --anon does all three)
 PROMPT
 
 EXIT;

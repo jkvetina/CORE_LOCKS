@@ -180,6 +180,30 @@ CREATE OR REPLACE PACKAGE BODY core_locksmith_ut AS
 
 
 
+    PROCEDURE test_locksmith#a_dependency_scanner_object_is_skipped
+    AS
+    BEGIN
+        -- built like the CORE_LOCK% test above: a CREATE on a PROCEDURE, so the
+        -- event and the type are both tracked and the DEPSCAN$ prefix is the only
+        -- reason nothing is locked.
+        --
+        -- The second half is the control, and it is what makes the first half mean
+        -- anything. The ordinary PROCEDURE probe is the same statement with a
+        -- different name in it, so a lock on that one and none on this one is the
+        -- prefix doing the work rather than the trigger being off, the suite
+        -- looking at the wrong object, or the compile silently failing
+        core_lock_fixture.compile_probe('DEPSCAN', 1);
+        --
+        ut.expect(core_lock_fixture.lock_count(core_lock_fixture.c_depscan)).to_equal(0);
+        ut.expect(core_lock_fixture.lock_count()).to_equal(0);
+        --
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        --
+        ut.expect(core_lock_fixture.lock_count(core_lock_fixture.c_proc)).to_equal(1);
+    END;
+
+
+
     PROCEDURE test_locksmith#a_hand_lock_matches_a_compile
     AS
         TYPE t_types IS TABLE OF VARCHAR2(30);

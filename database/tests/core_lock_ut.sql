@@ -723,6 +723,86 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
 
 
 
+    PROCEDURE test_extend_lock#reads_the_object_the_row_names
+    AS
+        rec                 core_locks%ROWTYPE;
+        v_after             core_locks%ROWTYPE;
+    BEGIN
+        -- two objects under lock at once, extended in the order they were NOT
+        -- created. The payload an extend writes comes from the lock row's own
+        -- object_type and object_name, and with one object in play any other
+        -- source (the last one compiled, the last one locked, the only one there
+        -- is) answers correctly by accident
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        core_lock_fixture.compile_probe('FUNCTION', 1);
+        --
+        core_lock.create_lock(USER, 'PROCEDURE', core_lock_fixture.c_proc);
+        core_lock.create_lock(USER, 'FUNCTION',  core_lock_fixture.c_fn);
+        --
+        rec := newest_lock(core_lock_fixture.c_proc);
+        core_lock.extend_lock(in_lock_id => rec.lock_id);
+        --
+        v_after := newest_lock(core_lock_fixture.c_proc);
+        --
+        ut.expect(v_after.object_payload).to_be_like('%' || LOWER(core_lock_fixture.c_proc) || '%');
+        ut.expect(v_after.object_payload).not_to_be_like('%' || LOWER(core_lock_fixture.c_fn) || '%');
+    END;
+
+
+
+    PROCEDURE test_extend_lock#a_view_keeps_the_fingerprint_it_was_locked_with
+    AS
+        rec                 core_locks%ROWTYPE;
+        v_after             core_locks%ROWTYPE;
+    BEGIN
+        -- a VIEW, because a view's header is stripped by a different rule from a
+        -- PL/SQL object's, and the type that picks between the two rules is read
+        -- from the lock row rather than passed in. Nothing about the view changes
+        -- between the lock and the extend, so the two fingerprints have to agree;
+        -- an extend that hashed under the wrong type, or skipped the header strip,
+        -- writes a hash the next compile compares against and refuses
+        core_lock_fixture.compile_probe('VIEW', 1);
+        core_lock.create_lock(USER, 'VIEW', core_lock_fixture.c_view);
+        --
+        rec := newest_lock(core_lock_fixture.c_view);
+        core_lock.extend_lock(in_lock_id => rec.lock_id);
+        --
+        v_after := newest_lock(core_lock_fixture.c_view);
+        --
+        ut.expect(rec.object_hash).to_be_not_null();
+        ut.expect(v_after.object_hash).to_equal(rec.object_hash);
+    END;
+
+
+
+    PROCEDURE test_extend_lock#a_dropped_object_keeps_the_last_payload
+    AS
+        rec                 core_locks%ROWTYPE;
+        v_after             core_locks%ROWTYPE;
+    BEGIN
+        core_lock_fixture.compile_probe('PROCEDURE', 1);
+        core_lock.create_lock(USER, 'PROCEDURE', core_lock_fixture.c_proc);
+        --
+        rec := newest_lock(core_lock_fixture.c_proc);
+        --
+        EXECUTE IMMEDIATE 'DROP PROCEDURE ' || core_lock_fixture.c_proc;
+
+        -- the object is gone, so there is no source to read and the extend has
+        -- nothing to write. Keeping what the row already holds is the whole point:
+        -- that row is now the last copy of the dropped object anybody has, and an
+        -- extend that overwrote it with the NULL it just read would destroy the
+        -- backup at the moment it became the only one
+        core_lock.extend_lock(in_lock_id => rec.lock_id);
+        --
+        v_after := newest_lock(core_lock_fixture.c_proc);
+        --
+        ut.expect(v_after.object_payload).to_be_not_null();
+        ut.expect(v_after.object_hash).to_equal(rec.object_hash);
+        ut.expect(v_after.counter).to_equal(rec.counter + 1);
+    END;
+
+
+
     PROCEDURE test_extend_lock#an_explicit_interval_sets_the_expiry
     AS
         rec                 core_locks%ROWTYPE;
