@@ -27,6 +27,15 @@ concurrency:
 
 jobs:
   utplsql:
+    # This repository is public and the runner is a personal machine, so a pull
+    # request opened from a fork would be a stranger's code running on it. The
+    # condition below holds for a push and for a pull request raised from a branch
+    # of this repository, and fails for every fork, which skips the job instead of
+    # running it. GitHub's own first-time-contributor approval sits in front as
+    # well, but that one is a click, and a click is not a boundary.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, core-locks]
     timeout-minutes: 15
 

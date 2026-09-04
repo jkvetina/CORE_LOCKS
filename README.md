@@ -488,3 +488,5 @@ It runs on a self-hosted macOS runner rather than a GitHub-hosted one, and the r
 The workflow names no path on that machine. The connect string defaults to the throwaway one `create_test_user.sql` already documents, and `CORE_LOCKS_SQLPLUS` and `CORE_LOCKS_CONTAINER` are repository variables with defaults, so the runner's own environment decides where `sqlplus` and the container runtime live.
 
 The first step asks the database whether it is open, as its own named step. A database that is down fails every later step anyway, but it fails them as "the tests did not pass", which is the one thing it does not mean.
+
+The job is guarded against forks. This repository is public and the runner is somebody's own machine, so a pull request opened from a fork would be a stranger's code running on it. The job's `if` holds for a push and for a pull request raised from a branch of this repository, and fails for every fork, which skips the job rather than running it.
