@@ -42,6 +42,8 @@ PROMPT ===== test fixture and suites
 @database/tests/core_lock_proxy_ut.sql
 @database/tests/core_lock_anon_ut.spec.sql
 @database/tests/core_lock_anon_ut.sql
+@database/tests/core_lock_apex_ut.spec.sql
+@database/tests/core_lock_apex_ut.sql
 
 PROMPT
 PROMPT ===== the locksmith starts enabled, whatever a half-finished run left behind

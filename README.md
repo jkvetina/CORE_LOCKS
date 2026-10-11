@@ -34,6 +34,7 @@ This repo is extracted from the author's [CORE23](https://github.com/jkvetina/CO
 - **No framework** – no `CORE`, no `CORE_CUSTOM`, no logging tables
 - **Source backup included** – every lock row carries a copy of the object's DDL
 - **Drop-in** – install into any schema that has APEX available
+- **APEX locks too** – lock an APEX application or a single page from PL/SQL, under the same name your DDL locks carry
 
 ---
 
@@ -49,6 +50,12 @@ GRANT EXECUTE ON dbms_scheduler TO <schema>;   -- the locksmith enable job
 ```
 
 `APEX_STRING` must be reachable; `get_object` uses `APEX_STRING.SPLIT_CLOBS` to normalize the captured DDL. `DBMS_OUTPUT` is used by `unlock` for feedback, and `DBMS_SQL` reads a view's query text out of its LONG column; both are granted to `PUBLIC` on a stock database, so neither costs you a privilege.
+
+The APEX locks need a bit more, and only if you use them. Application locks need APEX 26.2 or newer, because that is the release that added `APEX_APPLICATION_ADMIN.LOCK_APPLICATION`; on anything older they raise `APEX_VERSION_ERROR` and the rest of the package works as before. Page locks have no public API on any version, so they go through the internal package Page Designer itself calls, and that one needs a grant from `SYS`:
+
+```sql
+GRANT EXECUTE ON <APEX schema>.wwv_flow_property_dev TO <schema>;   -- page locks only
+```
 
 Every developer should reach the schema under an identifiable name, because a lock is only useful when you know who to call about it. Sessions that offer no name fall back to their IP address, and the `core_locksmith` trigger refuses the DDL when there is not even that. Setting this up has its own section: [Proxy Users & Startup Script](#4-proxy-users--startup-script).
 
@@ -308,6 +315,42 @@ core_lock.purge_locks();
 
 `raise_error` raises `ORA-20990` carrying the message, with `keeperrorstack` on. It is public because the trigger calls it from its own `WHEN OTHERS`. The matching `core_lock.app_exception` is pinned to the same code, so an APEX error handler already tuned to CORE23 keeps recognizing these errors unchanged.
 
+### APEX application and page locks
+
+Your database objects are not the only thing two developers overwrite. So the package locks APEX applications and pages as well, under the same name `get_user` gives a DDL lock, which is why the README keeps telling you to use your Builder name everywhere. Pass `in_locked_by` to lock for somebody else, a deploy account for example.
+
+```sql
+core_lock.create_lock   (in_app_id => 100, in_comment => 'Deploy 4711');
+core_lock.unlock        (in_app_id => 100);
+core_lock.get_lock      (in_app_id => 100);                     -- owner, NULL when free
+
+core_lock.create_lock   (in_app_id => 100, in_page_id => 10, in_comment => 'Reworking the grid');
+core_lock.unlock        (in_app_id => 100, in_page_id => 10);
+core_lock.get_lock      (in_app_id => 100, in_page_id => 10);
+```
+
+`create_lock` and `unlock` raise `ORA-20990` like the rest of the package, with a message you can act on:
+
+| Message | Meaning |
+| --- | --- |
+| `APP_LOCK_ERROR: APP_LOCKED_BY \`JAN\` [100]` | somebody else holds the application |
+| `PAGE_LOCK_ERROR: PAGE_LOCKED_BY \`JAN\` [100:10]` | somebody else holds the page |
+| `USER_ERROR: NOT_A_WORKSPACE_DEVELOPER \`CI\`` | APEX locks applications only for developers of that workspace |
+| `USER_ERROR: GRANT_WWV_FLOW_PROPERTY_DEV` | page locks need the grant from [Prerequisites](#2-prerequisites--requirements) |
+| `APEX_VERSION_ERROR: LOCK_APP_NEEDS_APEX_26_2` | there is no application lock API before 26.2 |
+| `APP_ERROR: APP_NOT_FOUND [100]` | the schema cannot see that application |
+| `PAGE_LOCK_ERROR: PAGE_NOT_LOCKED [100:10]` | APEX did not lock the page, a page that does not exist for example |
+
+A few things worth knowing before you put these into a pipeline:
+
+- **Unlock only ever releases your own lock.** `APEX_APPLICATION_ADMIN.UNLOCK_APPLICATION` with a NULL user removes anybody's lock, so a failed deploy would happily free a colleague's application. `unlock` never passes NULL, and it refuses a lock somebody else holds.
+- **APEX compares application lock owners case-insensitively, and page lock owners case-sensitively.** Every name goes through `clean_user`, which uppercases it, so you never get two `jan`s.
+- **An import keeps the application lock (26.2) and drops every page lock.** So call `get_lock` before a deploy: it names whoever holds the application, and `apex_application_locked_pages` shows whose page work the import is about to unlock.
+- **A page inside an application somebody else holds is refused too.** The application lock wins.
+- **The page lock package is undocumented.** It reads the holder from `APP_USER`, answers in JSON through the HTP buffer and never raises, so `create_lock` and `unlock` set `APP_USER` for a page call, hands the session its own value back afterwards, and reads the lock row back as the only proof it worked. Call it from a script or SQL, not from inside a running APEX page request, since it resets the OWA context and the HTP buffer.
+
+`create_lock` and `unlock` commit on their own, so a lock is visible to the Builder and other sessions straight away.
+
 ### Helpers
 
 `get_user`, `clean_user`, `recover_user`, `get_audit_trail`, `get_object`, and `get_clob_hash` are exposed for diagnostics. `get_object` reads the DDL statement through `ora_sql_txt` inside a trigger; called by hand it falls back to the dictionary, so pass it the type and the name (`core_lock.get_object('PACKAGE BODY', 'MY_PACKAGE')`) or it has nothing to look up.
@@ -386,7 +429,7 @@ ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 
 ## 9. Tests
 
-There are 77 utPLSQL tests in five suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the three things one session cannot show about itself: a lock seen from another session, an owner the database vouched for, and a session with no name at all.
+There are 99 utPLSQL tests in six suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the three things one session cannot show about itself: a lock seen from another session, an owner the database vouched for, and a session with no name at all.
 
 | File | What it holds |
 | --- | --- |
@@ -395,13 +438,17 @@ There are 77 utPLSQL tests in five suites, and they cover every public routine i
 | `database/tests/core_lock_conc_ut.spec.sql` / `.sql` | Two sessions at once, borrowed from the scheduler. 4 tests |
 | `database/tests/core_lock_proxy_ut.spec.sql` / `.sql` | Ownership through a proxy connection. 5 tests |
 | `database/tests/core_lock_anon_ut.spec.sql` / `.sql` | The refusal of a session that names nobody. 4 tests |
+| `database/tests/core_lock_apex_ut.spec.sql` / `.sql` | APEX application and page locks. 22 tests |
 | `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, second sessions, teardown ledger |
 | `database/tests/create_test_user.sql` | Creates the throwaway schema and its proxy account, run as SYSDBA |
 | `database/tests/install.sql` | Installs product and suites, then proves the install |
-| `database/tests/run.sql` | Runs everything except the `proxy` and `anon` tags, and fails the session when it is not green |
+| `database/tests/run.sql` | Runs everything except the `proxy`, `anon` and `apex` tags, and fails the session when it is not green |
 | `database/tests/run_proxy.sql` | Runs the proxy tag, and refuses a connection that has no proxy user |
 | `database/tests/run_anon.sql` | Runs the anon tag, and refuses a connection that has an address |
 | `database/tests/run_anon.sh` | Reaches a local connection inside the database's container |
+| `database/tests/create_test_apex.sql` | Creates the APEX workspace, its two developers and the page lock grant, run as SYSDBA |
+| `database/tests/install_apex.sql` / `core_lock_apex_app.sql` | Installs the two-page application the apex suite locks |
+| `database/tests/run_apex.sql` | Runs the apex tag |
 | `database/tests/run.sh` | Does all of the above from any working directory |
 
 You need utPLSQL v3 (measured against v3.2.3.4508 on 23ai) and the same `APEX_STRING` and `DBMS_CRYPTO` access the feature itself needs.
@@ -426,6 +473,13 @@ The proxy connect string is derived from the first, so the command above is stil
 The anon run is opt-in rather than opt-out, because it needs a shell on the database host and the ordinary caller of `run.sh` does not have one. Without `--anon` it says so on stdout for the same reason `--no-proxy` does. `--anon [container]` delegates to `run_anon.sh`, which steps inside the container and connects over IPC; the SQL arrives on stdin rather than as an `@` path, since the repository is not mounted in there and a script the container cannot open looks exactly like an empty green run.
 
 Both suites are tagged out of `run.sql` rather than left out of the install. Left in, they would fail on every ordinary run for the connection's reason rather than the product's, and the usual answer to that is `%disabled`, which is a test that never runs again. `run_proxy.sql` and `run_anon.sql` ask for their tag by name and raise when they find fewer tests than the suite declares, so a tag that stops matching is loud instead of quiet.
+
+The apex suite needs no special connection, it needs an APEX 26.2 workspace on the schema, which only `SYS` can create. So it is opt-in the same way: run `create_test_apex.sql` as SYSDBA once, then pass `--apex`, which installs the fixture application and runs the tag. Without it `run.sh` says the APEX locks went untested.
+
+```
+sqlplus "sys/<password>@<host>:<port>/<CDB service> as sysdba" @database/tests/create_test_apex.sql
+database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service> --apex
+```
 
 The concurrency suite needs no second connection. It hands its work to a `DBMS_SCHEDULER` job, which runs in a slave session with its own SID and its own transaction, so a lock really does have to cross between two sessions to be seen.
 
@@ -459,6 +513,8 @@ The test asserts how many racers actually ran before it asserts anything about t
 
 Green proves a suite runs; only red proves it asserts. Each of the 77 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, the proxy user's place at the top of the ownership ladder, the lock row an extend reads its payload from, and the history read that would stop seeing other sessions if it were scoped to this one. Sixty-six separate breakages across four sweeps, every one of them caught, and every test died to at least one.
 
+The apex suite got its own sweep of 18 breakages, from a lock that drops its comment to an unlock that uses the NULL admin hammer, a page lock that ignores the application lock and a failed page call that keeps the borrowed `APP_USER`. Every one was caught, and each of the 22 tests died to at least one. It found one product bug on the way: APEX raises the same `ORA-20003` for every invalid parameter, so a comment over 4000 characters came back as `NOT_A_WORKSPACE_DEVELOPER` until the translation started reading the parameter name.
+
 A mutation is anchored on the text around it and asserts how many places it expects to match. `extend_lock`'s two overloads carry byte-identical `UPDATE` bodies, so an unanchored find-and-replace hits the first one, leaves the overload under test untouched, and reports a surviving mutant that reads exactly like a coverage hole.
 
 The proxy suite's first test is the exception that proves the rest of it: it asserts the connection really is a proxy connection, so no product mutation can kill it. Its red comes from the other direction, by running the suite on an ordinary connection, where all five fail. Without it, the four that matter would pass on a database with no proxy in it by falling through the ladder to whatever the session happened to offer.
@@ -469,14 +525,14 @@ It also found two product bugs, both in behaviour the code claimed to have. A `D
 
 ### Coverage
 
-85.2% across 908 lines of `core_lock`, taken at `PLSQL_OPTIMIZE_LEVEL` 2. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
+84.9% of the 305 lines utPLSQL can cover in `core_lock`, taken at `PLSQL_OPTIMIZE_LEVEL` 2 on APEX 26.2. Most of what stays uncovered in the APEX part cannot run there at all: the version error below 26.2, the fallback for an APEX without lock columns, the missing grant, a page unlock APEX ignored, and an owner-less session, which only the anon connection can make. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
 
 `core_locksmith` contributes no lines to that denominator at all, because the profiler does not instrument a DDL trigger, so the tool reports it with a blank line count rather than a low percentage. The 15 tests in the trigger suite drive it through real compiles, and the mutation sweep breaks it on purpose, which is the only evidence that it runs at all. It is also why the tests added for the trigger's own branches move the number by nothing: those lines were never being counted.
 
-Measured over the 68 tests of the ordinary connection. A coverage runner that selects by suite name has to name the three suites that connection can reach, since neither the proxy suite nor the anon suite can pass on the connection a coverage run makes:
+Measured over the 90 tests of the ordinary connection, the apex suite included. A coverage runner that selects by suite name has to name the four suites that connection can reach, since neither the proxy suite nor the anon suite can pass on the connection a coverage run makes:
 
 ```
-adtai ut -schema CORE_LOCKS -name CORE_LOCK_UT,CORE_LOCKSMITH_UT,CORE_LOCK_CONC_UT -refresh -compact
+adtai ut -schema CORE_LOCKS -name CORE_LOCK_UT,CORE_LOCKSMITH_UT,CORE_LOCK_CONC_UT,CORE_LOCK_APEX_UT -refresh -compact
 ```
 
 ### Continuous integration

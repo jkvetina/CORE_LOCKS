@@ -9,6 +9,7 @@
 #   database/tests/run.sh -c <connect> -x <proxy-connect>
 #   database/tests/run.sh -c <connect> --no-proxy
 #   database/tests/run.sh -c <connect> --anon [container]
+#   database/tests/run.sh -c <connect> --apex
 #
 # The SQL scripts use repo-relative @ paths, so they have to be run from the
 # repository root. This finds the root from its own location and goes there, so
@@ -24,7 +25,11 @@
 #           bequeath connection on the database host itself. --anon delegates to
 #           run_anon.sh, which knows how to reach one inside a container.
 #
-# Both are tagged out of the main run and asked for by name.
+#   apex    needs an APEX 26.2 workspace on the schema, built once by
+#           create_test_apex.sql as SYSDBA. --apex installs the fixture
+#           application and runs run_apex.sql.
+#
+# All three are tagged out of the main run and asked for by name.
 #
 # --no-proxy skips the proxy run and says so on stdout; the anon run is off unless
 # --anon is given and says so too. Neither is ever silent, because a suite that
@@ -46,11 +51,12 @@ DO_INSTALL=1
 DO_RUN=1
 DO_PROXY=1
 DO_ANON=0
+DO_APEX=0
 ANON_CONTAINER=""
 
 usage() {
     echo "usage: $0 -c <connect-string> [-x <proxy-connect>] [--no-proxy]" >&2
-    echo "          [--anon [container]] [--install-only] [--run-only] [--sqlplus <path>]" >&2
+    echo "          [--anon [container]] [--apex] [--install-only] [--run-only] [--sqlplus <path>]" >&2
     exit 2
 }
 
@@ -59,7 +65,8 @@ while [ $# -gt 0 ]; do
         -c|--connect)   CONNECT="${2:-}"; shift 2 ;;
         -x|--proxy)     PROXY_CONNECT="${2:-}"; shift 2 ;;
         --sqlplus)      SQLPLUS="${2:-}"; shift 2 ;;
-        --install-only) DO_RUN=0; DO_PROXY=0; DO_ANON=0; shift ;;
+        --install-only) DO_RUN=0; DO_PROXY=0; DO_ANON=0; DO_APEX=0; shift ;;
+        --apex)         DO_APEX=1; shift ;;
         --run-only)     DO_INSTALL=0; shift ;;
         --no-proxy)     DO_PROXY=0; shift ;;
         --anon)
@@ -111,4 +118,11 @@ if [ "$DO_ANON" -eq 1 ]; then
     fi
 elif [ "$DO_RUN" -eq 1 ]; then
     echo "ANON SUITE SKIPPED: --anon was not passed, so the refusal of a nameless session is untested."
+fi
+
+if [ "$DO_APEX" -eq 1 ]; then
+    "$SQLPLUS" -S "$CONNECT" @database/tests/install_apex.sql
+    "$SQLPLUS" -S "$CONNECT" @database/tests/run_apex.sql
+elif [ "$DO_RUN" -eq 1 ]; then
+    echo "APEX SUITE SKIPPED: --apex was not passed, so the APEX application and page locks are untested."
 fi

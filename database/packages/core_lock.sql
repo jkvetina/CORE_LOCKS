@@ -905,6 +905,284 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         raise_error();
     END;
 
+
+
+    --
+    -- The workspace of an application, so the APEX calls below can run as it
+    --
+    FUNCTION get_workspace (
+        in_app_id           apex_applications.application_id%TYPE
+    )
+    RETURN apex_applications.workspace%TYPE
+    AS
+        v_workspace         apex_applications.workspace%TYPE;
+    BEGIN
+        SELECT MAX(a.workspace)
+        INTO v_workspace
+        FROM apex_applications a
+        WHERE a.application_id = in_app_id;
+        --
+        IF v_workspace IS NULL THEN
+            raise_error('APP_ERROR: APP_NOT_FOUND [' || in_app_id || ']');
+        END IF;
+        --
+        RETURN v_workspace;
+    END;
+
+
+
+    FUNCTION get_lock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE     := NULL
+    )
+    RETURN VARCHAR2
+    AS
+        v_owner             VARCHAR2(255);
+        --
+        invalid_column      EXCEPTION;
+        PRAGMA EXCEPTION_INIT(invalid_column, -904);
+    BEGIN
+        IF in_page_id IS NOT NULL THEN
+            SELECT MAX(p.locked_by)
+            INTO v_owner
+            FROM apex_application_locked_pages p
+            WHERE p.application_id  = in_app_id
+                AND p.page_id       = in_page_id;
+            --
+            RETURN v_owner;
+        END IF;
+
+        -- dynamic, because apex_applications carries the lock columns only since APEX 26.1,
+        -- and a static read would leave this package, and every DDL the locksmith guards,
+        -- invalid on an older APEX
+        EXECUTE IMMEDIATE
+            'SELECT MAX(a.locked_by) FROM apex_applications a WHERE a.application_id = :app_id'
+            INTO v_owner
+            USING in_app_id;
+
+        -- APEX compares application lock owners case-insensitively
+        RETURN UPPER(v_owner);
+    EXCEPTION
+    WHEN invalid_column THEN
+        -- WHY: no lock column means an APEX that cannot lock applications at all
+        RETURN NULL;
+    END;
+
+
+
+    --
+    -- The application lock through APEX_APPLICATION_ADMIN, APEX 26.2+. Dynamic, so the
+    -- package compiles on older APEX. Another holder is refused before this is called
+    --
+    PROCEDURE set_app_lock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_locked_by        core_locks.locked_by%TYPE,
+        in_lock             BOOLEAN,
+        in_comment          VARCHAR2                                := NULL
+    )
+    AS
+    BEGIN
+        APEX_UTIL.SET_WORKSPACE (
+            p_workspace     => get_workspace(in_app_id)
+        );
+        --
+        IF in_lock THEN
+            EXECUTE IMMEDIATE q'[
+                BEGIN
+                    APEX_APPLICATION_ADMIN.LOCK_APPLICATION (
+                        p_application_id    => :app_id,
+                        p_lock_as_user      => :locked_by,
+                        p_lock_comment      => :lock_comment
+                    );
+                END;]'
+                USING in_app_id, in_locked_by, in_comment;
+        ELSE
+            -- always the owner's name, a NULL user would remove anybody's lock
+            EXECUTE IMMEDIATE q'[
+                BEGIN
+                    APEX_APPLICATION_ADMIN.UNLOCK_APPLICATION (
+                        p_application_id    => :app_id,
+                        p_unlock_as_user    => :locked_by
+                    );
+                END;]'
+                USING in_app_id, in_locked_by;
+        END IF;
+        --
+    EXCEPTION
+    WHEN app_exception THEN
+        RAISE;
+    WHEN OTHERS THEN
+        IF SQLCODE = -6550 THEN
+            -- the dynamic block did not compile, the API is not there
+            raise_error('APEX_VERSION_ERROR: LOCK_APP_NEEDS_APEX_26_2');
+        ELSIF SQLCODE = -20003 AND SQLERRM LIKE '%p_lock_as_user%' THEN
+            -- the same code covers every invalid parameter, a long comment included
+            raise_error('USER_ERROR: NOT_A_WORKSPACE_DEVELOPER `' || in_locked_by || '`');
+        END IF;
+        --
+        raise_error();
+    END;
+
+
+
+    --
+    -- The page lock through the internal WWV_FLOW_PROPERTY_DEV, the one Page Designer calls.
+    -- It reads the holder from APP_USER, answers in JSON through the HTP buffer and never
+    -- raises, so the session gets its own APP_USER back on every path and the lock row
+    -- is read back as the only proof
+    --
+    PROCEDURE set_page_lock (
+        in_app_id           apex_application_pages.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE,
+        in_locked_by        core_locks.locked_by%TYPE,
+        in_lock             BOOLEAN,
+        in_comment          VARCHAR2                                := NULL
+    )
+    AS
+        v_names             OWA.VC_ARR;
+        v_prior             VARCHAR2(255)                           := V('APP_USER');
+        v_owner             all_objects.owner%TYPE;
+    BEGIN
+        -- the package owner through the current release's APEX_UTIL synonym, so a schema
+        -- left behind by an upgrade is never the one called
+        SELECT MAX(o.owner)
+        INTO v_owner
+        FROM all_objects o
+        JOIN all_synonyms s
+            ON s.table_owner    = o.owner
+        WHERE s.owner           = 'PUBLIC'
+            AND s.synonym_name  = 'APEX_UTIL'
+            AND o.object_name   = 'WWV_FLOW_PROPERTY_DEV'
+            AND o.object_type   = 'PACKAGE';
+        --
+        IF v_owner IS NULL THEN
+            raise_error('USER_ERROR: GRANT_WWV_FLOW_PROPERTY_DEV');
+        END IF;
+        --
+        APEX_UTIL.SET_WORKSPACE (
+            p_workspace     => get_workspace(in_app_id)
+        );
+        APEX_CUSTOM_AUTH.SET_USER (
+            p_user          => in_locked_by
+        );
+        OWA.INIT_CGI_ENV(0, v_names, v_names);
+        HTP.INIT;
+        --
+        IF in_lock THEN
+            EXECUTE IMMEDIATE 'BEGIN ' || DBMS_ASSERT.SCHEMA_NAME(v_owner) || '.WWV_FLOW_PROPERTY_DEV.LOCK_PAGE ('
+                || 'p_application_id => :app_id, p_page_id => :page_id, p_comment => :lock_comment); END;'
+                USING in_app_id, in_page_id, in_comment;
+        ELSE
+            EXECUTE IMMEDIATE 'BEGIN ' || DBMS_ASSERT.SCHEMA_NAME(v_owner) || '.WWV_FLOW_PROPERTY_DEV.UNLOCK_PAGE ('
+                || 'p_application_id => :app_id, p_page_id => :page_id); END;'
+                USING in_app_id, in_page_id;
+        END IF;
+        --
+        HTP.INIT;
+        APEX_CUSTOM_AUTH.SET_USER (
+            p_user          => v_prior
+        );
+        --
+        IF in_lock AND NVL(get_lock(in_app_id, in_page_id), '-') != in_locked_by THEN
+            raise_error('PAGE_LOCK_ERROR: PAGE_NOT_LOCKED [' || in_app_id || ':' || in_page_id || ']');
+        ELSIF NOT in_lock AND get_lock(in_app_id, in_page_id) IS NOT NULL THEN
+            raise_error('PAGE_LOCK_ERROR: PAGE_NOT_UNLOCKED [' || in_app_id || ':' || in_page_id || ']');
+        END IF;
+        --
+    EXCEPTION
+    WHEN OTHERS THEN
+        HTP.INIT;
+        APEX_CUSTOM_AUTH.SET_USER (
+            p_user          => v_prior
+        );
+        RAISE;
+    END;
+
+
+
+    PROCEDURE create_lock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE     := NULL,
+        in_locked_by        core_locks.locked_by%TYPE               := NULL,
+        in_comment          VARCHAR2                                := NULL
+    )
+    AS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        --
+        v_user              core_locks.locked_by%TYPE               := COALESCE(clean_user(in_locked_by), get_user());
+    BEGIN
+        IF v_user IS NULL THEN
+            raise_error('USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID');
+        END IF;
+
+        -- the application lock wins over every page in it
+        IF get_lock(in_app_id) != v_user THEN
+            raise_error('APP_LOCK_ERROR: APP_LOCKED_BY `' || get_lock(in_app_id) || '` [' || in_app_id || ']');
+        END IF;
+        --
+        IF in_page_id IS NULL THEN
+            set_app_lock(in_app_id, v_user, TRUE, in_comment);
+        ELSIF get_lock(in_app_id, in_page_id) != v_user THEN
+            raise_error('PAGE_LOCK_ERROR: PAGE_LOCKED_BY `' || get_lock(in_app_id, in_page_id) || '` [' || in_app_id || ':' || in_page_id || ']');
+        ELSIF get_lock(in_app_id, in_page_id) IS NULL THEN
+            set_page_lock(in_app_id, in_page_id, v_user, TRUE, in_comment);
+        END IF;
+        --
+        COMMIT;
+        --
+    EXCEPTION
+    WHEN app_exception THEN
+        ROLLBACK;
+        RAISE;
+    WHEN OTHERS THEN
+        ROLLBACK;
+        raise_error();
+    END;
+
+
+
+    PROCEDURE unlock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE     := NULL,
+        in_locked_by        core_locks.locked_by%TYPE               := NULL
+    )
+    AS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        --
+        v_user              core_locks.locked_by%TYPE               := COALESCE(clean_user(in_locked_by), get_user());
+        v_owner             VARCHAR2(255)                           := get_lock(in_app_id, in_page_id);
+    BEGIN
+        IF v_owner IS NULL THEN
+            RETURN;
+        END IF;
+
+        -- never somebody else's lock, whoever asks
+        IF v_owner != v_user OR v_user IS NULL THEN
+            raise_error(
+                CASE WHEN in_page_id IS NULL THEN 'APP_LOCK_ERROR: APP_LOCKED_BY' ELSE 'PAGE_LOCK_ERROR: PAGE_LOCKED_BY' END
+                || ' `' || v_owner || '` [' || in_app_id || CASE WHEN in_page_id IS NOT NULL THEN ':' || in_page_id END || ']'
+            );
+        END IF;
+        --
+        IF in_page_id IS NULL THEN
+            set_app_lock(in_app_id, v_user, FALSE);
+        ELSE
+            set_page_lock(in_app_id, in_page_id, v_user, FALSE);
+        END IF;
+        --
+        COMMIT;
+        --
+        DBMS_OUTPUT.PUT_LINE('APP ' || in_app_id || CASE WHEN in_page_id IS NOT NULL THEN ' PAGE ' || in_page_id END || ' UNLOCKED');
+        --
+    EXCEPTION
+    WHEN app_exception THEN
+        ROLLBACK;
+        RAISE;
+    WHEN OTHERS THEN
+        ROLLBACK;
+        raise_error();
+    END;
+
 END;
 /
 

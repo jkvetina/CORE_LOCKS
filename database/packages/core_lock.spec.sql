@@ -108,6 +108,43 @@ CREATE OR REPLACE PACKAGE core_lock AS
     )
     RETURN VARCHAR2;
 
+
+
+    --
+    -- APEX lock: the application lock (APEX 26.2+) when no page is given, a page lock
+    -- through the internal WWV_FLOW_PROPERTY_DEV otherwise, which needs EXECUTE granted
+    -- by SYS. The owner defaults to get_user(); an application lock owner has to be a
+    -- developer of the app's workspace. The application lock wins over its pages
+    --
+    PROCEDURE create_lock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE     := NULL,
+        in_locked_by        core_locks.locked_by%TYPE               := NULL,
+        in_comment          VARCHAR2                                := NULL
+    );
+
+
+
+    --
+    -- Release the owner's own APEX lock, never anybody else's
+    --
+    PROCEDURE unlock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE     := NULL,
+        in_locked_by        core_locks.locked_by%TYPE               := NULL
+    );
+
+
+
+    --
+    -- Who holds the application lock, or the page lock when a page is given, NULL when free
+    --
+    FUNCTION get_lock (
+        in_app_id           apex_applications.application_id%TYPE,
+        in_page_id          apex_application_pages.page_id%TYPE     := NULL
+    )
+    RETURN VARCHAR2;
+
 END;
 /
 

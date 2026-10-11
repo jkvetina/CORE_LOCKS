@@ -22,6 +22,8 @@
 --   anon    get_user ends on the session's IP address, which every TCP connection
 --           carries, so the refusal of a nameless session is unreachable from here.
 --           run_anon.sql runs it through a local IPC connection.
+--   apex    needs an APEX 26.2 workspace on this schema, which create_test_apex.sql
+--           builds as SYSDBA. run_apex.sql runs it.
 --
 set serveroutput on size unlimited
 set lines 200 pages 0 feed off verify off
@@ -37,7 +39,7 @@ DECLARE
 BEGIN
     FOR c IN (
         SELECT column_value AS line
-        FROM TABLE(ut.run(a_tags => '-proxy,-anon'))
+        FROM TABLE(ut.run(a_tags => '-proxy,-anon,-apex'))
     ) LOOP
         DBMS_OUTPUT.PUT_LINE(c.line);
         --
