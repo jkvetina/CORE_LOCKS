@@ -149,12 +149,15 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         -- short of a proxy user. A NAME_100_12345678901234 key is something else entirely:
         -- a context manager overwrote that startup script, and the name left inside the key
         -- is the application user, which for an SSO login is a company account and not the
-        -- name the developer works under
-        IF REGEXP_LIKE(v_ident, '_\d+_\d+$') THEN
-            -- a key in place of a name means a name was there and got overwritten,
-            -- and that is the only case the history is allowed to answer. A session
-            -- that never carried a name has nothing to recover, and naming it after
-            -- whoever sat at that machine last would be a guess dressed as a fact
+        -- name the developer works under. The same context manager, called from a
+        -- command line logon rather than from APEX, keys its data by a bare number,
+        -- 12345678901234 with no name in front, and that is an overwrite too
+        IF REGEXP_LIKE(v_ident, '(^\d+|_\d+_\d+)$') THEN
+            -- a key or a number in place of a name means the session carries an
+            -- identifier that names nobody, and that is the only case the history
+            -- is allowed to answer. A session with no identifier at all has nothing
+            -- to recover, and naming it after whoever sat at that machine last would
+            -- be a guess dressed as a fact
             v_lost := recover_user();
         ELSE
             v_told := clean_user(v_ident);
@@ -164,7 +167,7 @@ CREATE OR REPLACE PACKAGE BODY core_lock AS
         --   proxy user      the database authenticated the person, nothing beats that
         --   identifier      the session said who it is, and nothing overwrote it
         --   recovered       who this same workstation compiled as last time, and only
-        --                   when a context key proves the session did have a name
+        --                   when a context key or a bare number stands where a name was
         --   APEX user       the application user behind the session, a company account
         --                   under SSO, so it ranks below the workstation's own memory
         --   key remains     the name inside a context key, better than nothing

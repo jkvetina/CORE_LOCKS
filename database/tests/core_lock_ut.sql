@@ -218,6 +218,47 @@ CREATE OR REPLACE PACKAGE BODY core_lock_ut AS
 
 
 
+    PROCEDURE test_get_user#a_bare_number_asks_the_history
+    AS
+    BEGIN
+        -- a context manager called from a command line logon keys its data by a
+        -- number alone, so the name is gone without a trace in the identifier.
+        -- The workstation still remembers it, and the OS user must not win
+        core_lock_fixture.act_as('309731658396622');
+        --
+        INSERT INTO core_locks (
+            object_owner, object_type, object_name, locked_by,
+            locked_at, expire_at, counter, audit_trail
+        )
+        VALUES (
+            USER, 'PROCEDURE', 'CLUT_HISTORY', 'DAVE',
+            SYSDATE, SYSDATE, 1, core_lock.get_audit_trail()
+        );
+        --
+        COMMIT;
+        --
+        ut.expect(core_lock.get_user()).to_equal('DAVE');
+    END;
+
+
+
+    PROCEDURE test_get_user#a_bare_number_with_no_history_falls_through
+    AS
+        v_unnamed           core_locks.locked_by%TYPE;
+    BEGIN
+        -- with nothing in the history the number changes nothing: the session
+        -- lands where a session with no identifier lands, and never on the number
+        DBMS_SESSION.CLEAR_IDENTIFIER();
+        v_unnamed := core_lock.get_user();
+        --
+        core_lock_fixture.act_as('309731658396622');
+        --
+        ut.expect(core_lock.get_user()).to_equal(v_unnamed);
+        ut.expect(core_lock.get_user()).not_to_equal('309731658396622');
+    END;
+
+
+
     PROCEDURE test_get_user#falls_back_to_the_client_info_name
     AS
     BEGIN
