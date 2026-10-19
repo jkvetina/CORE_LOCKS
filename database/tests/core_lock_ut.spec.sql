@@ -48,6 +48,12 @@ CREATE OR REPLACE PACKAGE core_lock_ut AS
     -- %test(a context key over a name sends the question to the history)
     PROCEDURE test_get_user#a_context_key_asks_the_history;
 
+    -- %test(a bare number over a name sends the question to the history too)
+    PROCEDURE test_get_user#a_bare_number_asks_the_history;
+
+    -- %test(a bare number on a machine with no history answers as if no identifier was set)
+    PROCEDURE test_get_user#a_bare_number_with_no_history_falls_through;
+
     -- %test(falls back to the name inside client info, prefix and all)
     PROCEDURE test_get_user#falls_back_to_the_client_info_name;
 

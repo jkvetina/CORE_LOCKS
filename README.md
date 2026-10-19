@@ -143,7 +143,7 @@ END;
 /
 ```
 
-That call sets up the APEX session, and part of setting it up is overwriting `CLIENT_IDENTIFIER`. Your careful startup script is gone, replaced by whatever APEX or the application's own context code decides to put there, and some of those values are not names at all. One customer builds an application context key out of the user, the application and the session, so the identifier reads `JAN_100_12345678901234`, and a lock owned by that is a lock owned by nobody you can call.
+That call sets up the APEX session, and part of setting it up is overwriting `CLIENT_IDENTIFIER`. Your careful startup script is gone, replaced by whatever APEX or the application's own context code decides to put there, and some of those values are not names at all. One customer builds an application context key out of the user, the application and the session, so the identifier reads `JAN_100_12345678901234`, and a lock owned by that is a lock owned by nobody you can call. The same customer's command-line logon procedure, the one you run to execute DML as an application account, keys the context by a bare number instead, `309731658396622`, with no name in it at all.
 
 The obvious repair is to read the APEX user out of the session instead, and it is not enough. **The APEX application user is not your developer name.** Behind an SSO login it is your company account, `JKVETINA` rather than the `JAN` you are known as in the Builder and set in your startup script. Both names are genuinely yours, but only one of them is the one your colleagues will look for in a lock error, so promoting the application user just swaps one wrong answer for another.
 
@@ -176,13 +176,15 @@ It looks for an exact `audit_trail` match first, then widens to the address and 
 
 This is what makes attaching a session harmless. Your ordinary compiles, the ones where nothing overwrote your startup script, keep writing `JAN` into the history, and the attached-session compiles read it straight back out.
 
-**The recovery only ever repairs, it never invents.** It runs in exactly one situation: the identifier holds a context key, which is proof that a name was there and something wrote over it. A session that connected without a name has nothing to recover, and naming it after whoever sat at that machine last would be a guess dressed up as a fact. Those sessions fall through to the sources below and end at the IP address, which is honest about knowing nothing.
+**The recovery only ever repairs, it never invents.** It runs in exactly one situation: the session carries an identifier that names nobody, a context key or a bare number, which is what a context manager leaves behind when it writes over your name. A session that connected with no identifier at all has nothing to recover, and naming it after whoever sat at that machine last would be a guess dressed up as a fact. Those sessions fall through to the sources below and end at the IP address, which is honest about knowing nothing.
+
+A bare number is also what some tools (Toad) stamp on a session that never had a name. Asking the history there costs nothing: on your own machine it hands back the name you compile under everywhere else, and on a machine with no history the session falls through exactly as before.
 
 Two limits worth knowing. The recovery cannot invent history it does not have, so the first compile from a brand new machine still falls through. And when several people genuinely share one host, a Citrix farm being the usual case, the most recent name is a guess rather than a fact; that is the same shared-host problem as [The IP fallback](#the-ip-fallback), except it guesses a colleague instead of admitting an address. Give those people proxy users.
 
 ### The IP fallback
 
-Not every tool leaves a name behind. Some set nothing at all, and some (Toad likes doing this) stamp `CLIENT_IDENTIFIER` with a plain number, which looks like an identity but names nobody. So a value made of digits only is thrown away, and so is anything naming a pool or a process rather than a person, `ORDS_PUBLIC_USER` and `ANONYMOUS` and friends.
+Not every tool leaves a name behind. Some set nothing at all, and some (Toad likes doing this) stamp `CLIENT_IDENTIFIER` with a plain number, which looks like an identity but names nobody. So a value made of digits only is never used as a name (it sends the question to [the history](#recovering-a-lost-name) first), and so is anything naming a pool or a process rather than a person, `ORDS_PUBLIC_USER` and `ANONYMOUS` and friends.
 
 What is left is your operating system login, which most editors hand over without being asked. Nobody authenticated it, and behind a company login it is your company account rather than the name you work under, so it is the weakest name in the list. It is also the one that costs a developer nothing: skip the startup script entirely and your locks still carry something a colleague can act on.
 
@@ -215,7 +217,7 @@ Run it again after attaching an APEX session. It should still be your name.
 |---|---|---|
 | 1 | `PROXY_USER` | The database authenticated the person, nothing beats that |
 | 2 | `CLIENT_IDENTIFIER` | Your startup script or APEX, as long as nothing overwrote it |
-| 3 | `recover_user` | Who this same workstation compiled as last time |
+| 3 | `recover_user` | Who this same workstation compiled as last time, asked when the identifier is a context key or a bare number |
 | 4 | `APEX$SESSION.APP_USER` | The application user, a company account behind an SSO login |
 | 5 | `CLIENT_IDENTIFIER` again | The name left inside a context key, once the key part is stripped |
 | 6 | `CLIENT_INFO` | The same idea, minus any prefix a job put in front of it |
@@ -429,11 +431,11 @@ ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 
 ## 9. Tests
 
-There are 99 utPLSQL tests in six suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the three things one session cannot show about itself: a lock seen from another session, an owner the database vouched for, and a session with no name at all.
+There are 101 utPLSQL tests in six suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the three things one session cannot show about itself: a lock seen from another session, an owner the database vouched for, and a session with no name at all.
 
 | File | What it holds |
 | --- | --- |
-| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 49 tests |
+| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 51 tests |
 | `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 15 tests |
 | `database/tests/core_lock_conc_ut.spec.sql` / `.sql` | Two sessions at once, borrowed from the scheduler. 4 tests |
 | `database/tests/core_lock_proxy_ut.spec.sql` / `.sql` | Ownership through a proxy connection. 5 tests |
@@ -464,7 +466,7 @@ database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service> --anon
 
 | Connection | Suites | Tests | Why it has to be its own connection |
 | --- | --- | --- | --- |
-| ordinary | unit, trigger, concurrency | 68 | it is the plain connection everything else is measured against |
+| ordinary | unit, trigger, concurrency | 70 | it is the plain connection everything else is measured against |
 | `CLUT_PROXY[CORE_LOCKS]` | proxy | 5 | `PROXY_USER` is fixed at connect time |
 | local IPC, inside the host | anon | 4 | only a connection with no IP address resolves to nobody |
 
