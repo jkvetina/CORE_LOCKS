@@ -4,360 +4,388 @@
 
 <br>
 <p><img src="docs/one_pager_comix.png" alt="CORE_LOCKS comix"></p>
+
 <br>
 
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
-2. [Prerequisites & Requirements](#2-prerequisites--requirements)
-3. [Installation & Setup](#3-installation--setup)
-4. [Proxy Users & Startup Script](#4-proxy-users--startup-script)
-5. [How It Works](#5-how-it-works)
-6. [API Reference](#6-api-reference)
-7. [Configuration](#7-configuration)
-8. [Operational Notes](#8-operational-notes)
+2. [How It Works](#2-how-it-works)
+3. [APEX](#3-apex)
+4. [API Reference](#4-api-reference)
+5. [Configuration](#5-configuration)
+6. [Operational Notes](#6-operational-notes)
+7. [Installation & Setup](#7-installation--setup)
+8. [Proxy Users & Startup Script](#8-proxy-users--startup-script)
 9. [Tests](#9-tests)
 
----
+<br>
 
 ## 1. Project Overview
 
-**CORE_LOCKS** answers a single question on a shared development schema: *who last touched this object, and am I about to overwrite their work?*
+Two developers, one dev schema, one package, and the last compile wins. Nobody gets a warning; the colleague's work is simply gone. CORE_LOCKS locks every object the moment somebody compiles it, and refuses the compile when somebody else holds it.
 
-It hooks every DDL statement in the schema, records who ran it, keeps a copy of the source, and refuses a compile when someone else already holds a live lock on that object. Two developers compiling the same package no longer silently overwrite each other; the second one gets an error instead of a surprise.
+- **Nothing to call.** A DDL trigger takes the lock on every `CREATE`, `ALTER` and `DROP`.
+- **Every compile is a backup.** Each lock row keeps the source that was compiled.
+- **APEX too.** Builder compiles are tracked as they are, and you can lock an application or a single page.
+- **Five objects, no framework.** One table, one package, one trigger, two jobs. Extracted from [CORE23](https://github.com/jkvetina/CORE23), without its `CORE` and `CORE_CUSTOM` packages.
 
-This repo is extracted from the author's [CORE23](https://github.com/jkvetina/CORE23) framework. In CORE23, the LOCK feature depends on the `CORE` and `CORE_CUSTOM` packages plus the `CORE_LOGS` table, roughly 6,300 lines of framework for what is really a self-contained idea. This version cuts that away.
+<br>
 
-**Key characteristics:**
+## 2. How It Works
 
-- **Five objects** – one table, one package, one trigger, two jobs
-- **No framework** – no `CORE`, no `CORE_CUSTOM`, no logging tables
-- **Source backup included** – every lock row carries a copy of the object's DDL
-- **Drop-in** – install into any schema that has APEX available
-- **APEX locks too** – lock an APEX application or a single page from PL/SQL, under the same name your DDL locks carry
+### Two developers, one package
 
----
-
-## 2. Prerequisites & Requirements
-
-Oracle Database 12c or later (identity columns are used for `lock_id`).
-
-Two grants are required from `SYS`:
+ALICE compiles a package. She does nothing special, the trigger takes the lock for her:
 
 ```sql
-GRANT EXECUTE ON dbms_crypto TO <schema>;      -- SHA-256 source hashing
-GRANT EXECUTE ON dbms_scheduler TO <schema>;   -- the locksmith enable job
-```
-
-`APEX_STRING` must be reachable; `get_object` uses `APEX_STRING.SPLIT_CLOBS` to normalize the captured DDL. `DBMS_OUTPUT` is used by `unlock` for feedback, and `DBMS_SQL` reads a view's query text out of its LONG column; both are granted to `PUBLIC` on a stock database, so neither costs you a privilege.
-
-The APEX locks need a bit more, and only if you use them. Application locks need APEX 26.2 or newer, because that is the release that added `APEX_APPLICATION_ADMIN.LOCK_APPLICATION`; on anything older they raise `APEX_VERSION_ERROR` and the rest of the package works as before. Page locks have no public API on any version, so they go through the internal package Page Designer itself calls, and that one needs a grant from `SYS`:
-
-```sql
-GRANT EXECUTE ON <APEX schema>.wwv_flow_property_dev TO <schema>;   -- page locks only
-```
-
-Every developer should reach the schema under an identifiable name, because a lock is only useful when you know who to call about it. Sessions that offer no name fall back to their IP address, and the `core_locksmith` trigger refuses the DDL when there is not even that. Setting this up has its own section: [Proxy Users & Startup Script](#4-proxy-users--startup-script).
-
----
-
-## 3. Installation & Setup
-
-Install in this order – the package body will not compile before the table exists, and the trigger needs the package:
-
-```
-database/tables/core_locks.sql
-database/packages/core_lock.spec.sql
-database/packages/core_lock.sql
-database/triggers/core_locksmith.sql
-database/jobs/core_locksmith_enable.sql
-database/jobs/core_locks_purge.sql
-```
-
-Both jobs are optional but recommended; see [Operational Notes](#8-operational-notes) for what they do and why they matter.
-
----
-
-## 4. Proxy Users & Startup Script
-
-A lock is only as good as the name on it. Generic shared logins are rejected by design; a lock owned by "the schema account" tells you nothing about who to call. A session that offers no name gets its IP address instead, and one that cannot offer even that is refused with `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID` (see [The IP fallback](#the-ip-fallback)).
-
-There are two ways to give a session a real name. Pick one for the whole team.
-
-### Proxy users (recommended)
-
-Each developer gets a personal database login and connects through it to the shared schema. Nobody needs to know the schema password, and taking access away from one person is a single statement.
-
-As a DBA, once per developer:
-
-```sql
-CREATE USER jan IDENTIFIED BY "SomeStrongPassword#1";
-GRANT CREATE SESSION TO jan;
-
-ALTER USER apps GRANT CONNECT THROUGH jan;
-```
-
-The developer then connects with the `proxy[schema]` syntax and their own password:
-
-```sql
-CONNECT jan[apps]/"SomeStrongPassword#1"@dev_db
-```
-
-In SQL Developer and most other tools the same string goes straight into the username field: `jan[apps]`. The session runs as `apps` with all its privileges, but `SYS_CONTEXT('USERENV', 'PROXY_USER')` returns `JAN`, and that is the name the lock rows carry. Nothing to run after connecting, nothing to forget; the identity is part of the connection itself.
-
-To take the access away again:
-
-```sql
-ALTER USER apps REVOKE CONNECT THROUGH jan;
-```
-
-### Startup script (CLIENT_IDENTIFIER)
-
-No DBA willing to create users? Then each session identifies itself:
-
-```sql
-BEGIN
-    DBMS_SESSION.SET_IDENTIFIER('JAN');
+CREATE OR REPLACE PACKAGE orders_api AS
+    PROCEDURE ship_order (in_order_id NUMBER);
 END;
 /
 ```
 
-**Use the same name you have in the APEX Builder.** This is the part people get wrong, and it costs them later. Your locks follow you between tools only when the name does, so if the Builder knows you as `JAN`, put `JAN` in the startup script too. Get that right and you can edit a package in the Object Browser, finish it in your own editor, and it stays one lock held by one person the whole time. Get it wrong and `JAN` in the browser and `JKVETINA` in SQL Developer are two colleagues who keep locking each other out, and both of them are you.
+```text
+Package created.
+```
 
-The catch: `CLIENT_IDENTIFIER` lives only as long as the session. Reconnect and it is gone, and your next lock row falls back to your operating system login, or a bare IP address, instead of the name you meant. So don't run it by hand; wire it into your tool so it fires on every connect:
-
-- **SQL Developer** – Tools > Preferences > Database > "Filename for connection startup script", pointed at a file containing the block above.
-- **SQLcl and SQL\*Plus** – put the block into `login.sql`, which runs after every `CONNECT`. Since 12.2, SQL\*Plus reads it only from `SQLPATH`/`ORACLE_PATH`, not from the current directory.
-- **Other tools** – look for a logon or post-connect script hook; most IDEs have one.
-
-Compiles from APEX need no setup at all. SQL Workshop and the Object Browser both work, so editing a package in the browser and saving it is tracked like any other DDL. APEX stamps the session with the Builder user who is logged in, in the shape `JAN:12345678`, and the trailing session number is dropped, so the lock row carries the Builder username on its own.
-
-### APEX sessions from your editor
-
-Sooner or later you will want an APEX session inside your own editor, usually to debug something that only misbehaves with session state loaded:
+While her lock is live, BOB compiles his own version of the same package:
 
 ```sql
-BEGIN
-    APEX_SESSION.ATTACH(p_app_id => 100, p_page_id => 20, p_session_id => :p_session_id);
+CREATE OR REPLACE PACKAGE orders_api AS
+    PROCEDURE ship_order (in_order_id NUMBER, in_carrier VARCHAR2);
 END;
 /
 ```
 
-That call sets up the APEX session, and part of setting it up is overwriting `CLIENT_IDENTIFIER`. Your careful startup script is gone, replaced by whatever APEX or the application's own context code decides to put there, and some of those values are not names at all. One customer builds an application context key out of the user, the application and the session, so the identifier reads `JAN_100_12345678901234`, and a lock owned by that is a lock owned by nobody you can call. The same customer's command-line logon procedure, the one you run to execute DML as an application account, keys the context by a bare number instead, `309731658396622`, with no name in it at all.
+```text
+ORA-04088: error during execution of trigger 'CORE_LOCKS.CORE_LOCKSMITH'
+ORA-00604: Error occurred at recursive SQL level 1. Check subsequent errors.
+ORA-20990: LOCK_TIME_ERROR: OBJECT_LOCKED_BY `ALICE` [22513]
+```
 
-The obvious repair is to read the APEX user out of the session instead, and it is not enough. **The APEX application user is not your developer name.** Behind an SSO login it is your company account, `JKVETINA` rather than the `JAN` you are known as in the Builder and set in your startup script. Both names are genuinely yours, but only one of them is the one your colleagues will look for in a lock error, so promoting the application user just swaps one wrong answer for another.
+- `ALICE` holds the package, so BOB knows who to call.
+- `22513` is her lock row, with her source in it.
+- BOB's compile is refused, and the package in the database is still ALICE's version.
+- The lock runs 20 minutes from her last compile, and every compile she makes pushes it out again.
 
-What actually knows your name is the history. See [Recovering a lost name](#recovering-a-lost-name) below. Go ahead and attach; your locks keep saying `JAN`.
+<br>
 
-One thing to keep in mind, and it is easy to forget in the middle of debugging: an attached session carries its own user, and with no history to fall back on that user is the one your compile is recorded under. Attach a colleague's session on a machine the lock table has never seen and you become them, quietly extending a lock they are holding. You did not come here to be someone else, you came for their session state. Detach when you are done:
+### Every compile is a backup
+
+ALICE adds a procedure and compiles again. Same lock, refreshed:
+
+```sql
+SELECT t.lock_id, t.object_name, t.locked_by, t.locked_at, t.expire_at, t.counter
+FROM core_locks t
+ORDER BY t.lock_id;
+```
+
+```text
+   LOCK_ID OBJECT_NAME  LOCKED_BY  LOCKED_AT        EXPIRE_AT           COUNTER
+---------- ------------ ---------- ---------------- ---------------- ----------
+     22513 ORDERS_API   ALICE      2026-10-25 17:48 2026-10-25 18:08          2
+```
+
+The row holds the source of her last compile:
+
+```sql
+SELECT t.object_payload
+FROM core_locks t
+WHERE t.lock_id = 22513;
+```
+
+```text
+CREATE OR REPLACE PACKAGE orders_api AS
+    PROCEDURE ship_order (in_order_id NUMBER);
+    PROCEDURE cancel_order (in_order_id NUMBER);
+END;
+```
+
+- **One row per 10 minutes of work.** Compiles inside 10 minutes refresh the same row, a later one closes it and starts a new one, so the table keeps a version of the object as you go.
+- **A `DROP` is backed up too.** Its row carries the source of what was dropped, so the last copy of a dropped package is still here.
+- **`ALTER ... COMPILE` is skipped.** Recompiling is not a change.
+- **Seven days in full.** After that the `CORE_LOCKS_PURGE` job keeps one row per object (owner, time and the SHA-256 hash of the source) and drops the source text.
+
+<br>
+
+### Take over a lock
+
+ALICE is done and releases the package (or her 20 minutes run out):
 
 ```sql
 BEGIN
-    APEX_SESSION.DETACH;
+    core_lock.unlock(
+        in_object_name      => 'ORDERS_API'
+    );
 END;
 /
 ```
 
-### Recovering a lost name
+BOB compiles the package as it is in the database, and this time it goes through:
 
-When the session cannot say who it belongs to, the table can. Every lock row carries an `audit_trail`, and the first two fields of it are the address and the host the DDL came from:
-
+```text
+   LOCK_ID OBJECT_NAME  LOCKED_BY  LOCKED_AT        EXPIRE_AT           COUNTER
+---------- ------------ ---------- ---------------- ---------------- ----------
+     22513 ORDERS_API   ALICE      2026-10-25 17:48                           2
+     22514 ORDERS_API   BOB        2026-10-25 17:48 2026-10-25 18:08          1
 ```
-10.20.30.44|WORKGROUP\DEV-PC-07|+02:00|
-```
 
-That is a workstation, and a workstation is a person. So before falling back on anything generic, `recover_user` asks the history what this same machine compiled as last time, newest row wins:
+When you take an object over from somebody else, compile it once **unchanged** first. That proves your copy matches what is in the database, and only then make your edits.
+
+Who holds what right now:
 
 ```sql
-SELECT core_lock.recover_user() FROM dual;
+SELECT t.locked_by, t.object_type, t.object_name, t.expire_at
+FROM core_locks t
+WHERE t.expire_at >= SYSDATE
+ORDER BY t.locked_by, t.object_name;
 ```
 
-It looks for an exact `audit_trail` match first, then widens to the address and host on their own, which covers the case where you were in SQLcl yesterday and Toad today. Values that name no person are skipped on the way, so an old IP-address row never comes back as an answer.
-
-This is what makes attaching a session harmless. Your ordinary compiles, the ones where nothing overwrote your startup script, keep writing `JAN` into the history, and the attached-session compiles read it straight back out.
-
-**The recovery only ever repairs, it never invents.** It runs in exactly one situation: the session carries an identifier that names nobody, a context key or a bare number, which is what a context manager leaves behind when it writes over your name. A session that connected with no identifier at all has nothing to recover, and naming it after whoever sat at that machine last would be a guess dressed up as a fact. Those sessions fall through to the sources below and end at the IP address, which is honest about knowing nothing.
-
-A bare number is also what some tools (Toad) stamp on a session that never had a name. Asking the history there costs nothing: on your own machine it hands back the name you compile under everywhere else, and on a machine with no history the session falls through exactly as before.
-
-Two limits worth knowing. The recovery cannot invent history it does not have, so the first compile from a brand new machine still falls through. And when several people genuinely share one host, a Citrix farm being the usual case, the most recent name is a guess rather than a fact; that is the same shared-host problem as [The IP fallback](#the-ip-fallback), except it guesses a colleague instead of admitting an address. Give those people proxy users.
-
-### The IP fallback
-
-Not every tool leaves a name behind. Some set nothing at all, and some (Toad likes doing this) stamp `CLIENT_IDENTIFIER` with a plain number, which looks like an identity but names nobody. So a value made of digits only is never used as a name (it sends the question to [the history](#recovering-a-lost-name) first), and so is anything naming a pool or a process rather than a person, `ORDS_PUBLIC_USER` and `ANONYMOUS` and friends.
-
-What is left is your operating system login, which most editors hand over without being asked. Nobody authenticated it, and behind a company login it is your company account rather than the name you work under, so it is the weakest name in the list. It is also the one that costs a developer nothing: skip the startup script entirely and your locks still carry something a colleague can act on.
-
-Only when even that is missing does the session fall back to its IP address:
-
-```
-LOCK_TIME_ERROR: OBJECT_LOCKED_BY `10.20.30.44` [10231]
+```text
+LOCKED_BY  OBJECT_TYPE  OBJECT_NAME  EXPIRE_AT
+---------- ------------ ------------ ----------------
+BOB        PACKAGE      ORDERS_API   2026-10-25 18:08
 ```
 
-Not a person, but still something you can trace, and the lock keeps doing its actual job of stopping two people from compiling the same package. Two things to know about it:
+<br>
 
-- Developers sharing one machine share one lock owner. On a Citrix farm or behind a NAT everyone arrives from the same address, so the feature cannot tell them apart, and [Recovering a lost name](#recovering-a-lost-name) inherits the same blind spot one step earlier.
-- A local connection on the database server has no IP at all, and neither does a scheduler job. Both run as the database's own operating system account, which is on the rejected list, so those are still refused with `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID`.
+### What the trigger decides
 
-Treat the fallback as a safety net for the tool you cannot configure, not as a replacement for a proxy user.
-
-### Verify
-
-```sql
-SELECT core_lock.get_user() FROM dual;
-```
-
-NULL means your next compile will fail. An IP address means nothing named your session and the fallback took over, so go back and wire one of the two options above. Anything else is exactly the name your colleagues will see in `OBJECT_LOCKED_BY` errors, so keep it consistent across tools – `JAN` in SQL Developer and `JKVETINA` in SQLcl count as two different people.
-
-Run it again after attaching an APEX session. It should still be your name.
-
-`get_user` walks these sources and takes the first one that names a person:
-
-| Order | Source | Where it comes from |
-|---|---|---|
-| 1 | `PROXY_USER` | The database authenticated the person, nothing beats that |
-| 2 | `CLIENT_IDENTIFIER` | Your startup script or APEX, as long as nothing overwrote it |
-| 3 | `recover_user` | Who this same workstation compiled as last time, asked when the identifier is a context key or a bare number |
-| 4 | `APEX$SESSION.APP_USER` | The application user, a company account behind an SSO login |
-| 5 | `CLIENT_IDENTIFIER` again | The name left inside a context key, once the key part is stripped |
-| 6 | `CLIENT_INFO` | The same idea, minus any prefix a job put in front of it |
-| 7 | `OS_USER` | Your desktop login, for an editor you never got around to configuring |
-| 8 | `IP_ADDRESS` | Not a person, but traceable |
-
-Rows 2 and 5 are the same context split in two on purpose. An identifier that reads `JAN` or `JAN:12345678` is the session telling you who it is, and that outranks everything but a proxy user. An identifier that reads `JAN_100_12345678901234` is a context manager telling you what it keyed its data by, which is a different claim and a weaker one, so it waits until the history and the APEX session have both had their turn.
-
-Every name that comes out of this is uppercased. The lock compares owners as plain strings, so `Jan`, `JAN` and `jan` would be three different developers who cannot see each other's locks, and one of them would be locked out by themselves.
-
-Every candidate passes through `core_lock.clean_user` first. That strips a trailing session number, so `JAN:12345678` and `JAN_100_12345678901234` both come back as `JAN`, and it throws away anything that is only digits or names a pool account instead of a person.
-
----
-
-## 5. How It Works
-
-`core_locksmith` fires `AFTER DDL ON SCHEMA`. It ignores `DEPSCAN$%` procedures (dependency-scanner noise) and anything named `CORE_LOCK%`, so the feature cannot lock itself out. For `CREATE`, `ALTER`, and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions, and triggers, it first refuses the statement outright when `core_lock.get_user()` comes back NULL, which means a session that offered no proxy user, no usable identifier, no history for its workstation, no APEX user, no operating system login and no IP address (see [The IP fallback](#the-ip-fallback)), and then calls `core_lock.create_lock`.
-
-A materialized view is the one type where the dictionary and the lock row call the same thing by different names. Every DDL event Oracle fires for one reports `ORA_DICT_OBJ_TYPE` as `SNAPSHOT`, so that is what the trigger's filter asks for, and it records `MATERIALIZED VIEW`, which is the name `object_body` and `DBMS_METADATA` both use. One object under one type name is what lets a lock taken by a compile and a lock taken by hand find each other in the history.
-
-`create_lock` captures the statement's own text through `ora_sql_txt` and keeps it as the backup, and skips `ALTER ... COMPILE` entirely, because recompiling is not a change. A `DROP` is the other statement that is not source: it opens a lock like anything else, but the row it opens carries the source of what was dropped rather than the text of the drop, which makes that row the last surviving backup of the object. Source-bearing object types are then hashed with SHA-256, and what gets hashed is the object **without its CREATE header**. That header is the one part of the text nobody writes the same way twice, so dropping it is what makes two fingerprints of the same object comparable. See [Create lock](#create-lock) for why that matters the moment you take a lock by hand.
-
-It then reads the most recent lock row for that object and decides:
+`core_locksmith` fires `AFTER DDL ON SCHEMA` for `CREATE`, `ALTER` and `DROP` on tables, views, materialized views, packages, package bodies, procedures, functions and triggers. It ignores `DEPSCAN$%` and anything named `CORE_LOCK%`, so the feature cannot lock itself out.
 
 | Situation | Outcome |
-|---|---|
-| Same user holds the lock | Lock extended, source and hash refreshed |
-| Different user, lock still live | `LOCK_TIME_ERROR: OBJECT_LOCKED_BY ...` – DDL fails |
-| Hash differs from the stored one, within a minute of the lock | `LOCK_HASH_ERROR: OBJECT_CHANGED_BY ...` – DDL fails |
-| Lock older than the rebook window | Current row closed, new row inserted as a fresh backup point |
-| No lock at all | New row inserted |
+| --- | --- |
+| No lock on the object | new row, the compile goes through |
+| Same user holds the lock | lock extended, source and hash refreshed |
+| Different user, lock still live | `LOCK_TIME_ERROR: OBJECT_LOCKED_BY ...`, the compile is refused |
+| Different user, lock no longer live, cut less than a minute ago, and the source hash differs | `LOCK_HASH_ERROR: OBJECT_CHANGED_BY ...`, the compile is refused |
+| Lock older than the rebook window | current row closed, new row inserted as a fresh backup point |
+| Session names nobody | `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID`, the compile is refused |
 
-The hash check is the subtle one. When you take an object over from someone else, compile it once **unchanged** first. That proves your source matches what is actually in the database, and only then should you apply your edits; otherwise you are compiling over changes made while you were not looking.
+- **The hash skips the `CREATE ... AS` header,** the one part nobody writes the same way twice. That is what lets a lock booked by hand and a lock taken by a compile fingerprint the same object identically.
+- **The trigger hashes the statement it was handed,** never the dictionary: inside an `AFTER DDL` trigger the compile has not committed yet, so the dictionary still holds the previous version.
+- **A materialized view** arrives as `SNAPSHOT` and is recorded as `MATERIALIZED VIEW`, the name `DBMS_METADATA` uses, so a compile and a hand lock find each other in the history.
 
-Because each rebook writes a new row rather than updating in place, `core_locks` accumulates a history of the object's source over time, not just its current state. That history is kept in full for the last 7 days; beyond that the `CORE_LOCKS_PURGE` job collapses it to one hash-only row per object (see [Operational Notes](#8-operational-notes)).
+<br>
 
----
+## 3. APEX
 
-## 6. API Reference
+### Builder compiles are tracked as they are
 
-All procedures run as autonomous transactions and commit on their own – they must, since they are driven from a DDL trigger.
+- **Nothing to set up.** A package saved in the Object Browser or SQL Workshop goes through the same trigger as one compiled in your editor.
+- **The lock carries your Builder name.** APEX stamps the session as `JAN:12345678`, and the session number is dropped, so the row says `JAN`.
+- **Use the same name in your editor** ([Proxy Users & Startup Script](#8-proxy-users--startup-script)), and a package you start in the browser and finish in SQL Developer stays one lock held by one person.
 
-### Create lock
+<br>
 
-`create_lock` is what the trigger calls on every compile, and it takes a lock by hand just as well, to hold an object you are about to deploy over or to book one before you start editing it.
+### Lock an application or a page
 
-```sql
-core_lock.create_lock (
-    in_object_owner     => 'APPS',
-    in_object_type      => 'PACKAGE BODY',
-    in_object_name      => 'MY_PACKAGE',
-    in_locked_by        => NULL,     -- defaults to get_user()
-    in_expire_at        => NULL,     -- defaults to now + g_lock_length
-    in_hash_check       => TRUE
-);
-```
-
-Called by hand there is no DDL statement to copy, so the backup is rebuilt from the dictionary instead. `user_source` holds it for packages, package bodies, procedures, functions and triggers, exactly as the developer typed it after `CREATE OR REPLACE`, so putting that prefix back gives the compiled statement character for character. A view's query comes out of `user_views` under a canonical header. Anything else, a table being the usual one, falls back to `DBMS_METADATA.GET_DDL`. An object the dictionary has nothing for is still locked, just without a backup.
-
-**A lock booked by hand and a lock taken by a compile fingerprint the same object identically.** That is the whole point, and it is not free, because the two sources disagree about the header and about nothing else: the dictionary quotes and schema qualifies the name, adds `EDITIONABLE`, prints a view's column list, and drops a `FORCE` in front of it. So the hash is taken from the body, with the `CREATE ... AS` header removed, and a view loses everything through its first standalone `AS`, since `user_views` never stored a header at all. Measured on Oracle 26ai across all six source-bearing types: hand-lock after a compile, hand-lock then compile, both clean, and a genuine edit by somebody else still refused.
-
-Two traps are worth naming, because both of them look like the code working:
-
-- **`GET_DDL` reprints, it does not repeat.** Asked for a `PACKAGE` it hands back the spec *and* the body; asked for a `TRIGGER` it appends an `ALTER TRIGGER ... ENABLE`. Neither of those is the object you locked, which is why the dictionary's own source columns come first now.
-- **`create_lock` is autonomous, so it cannot see the DDL that is calling it.** Inside an `AFTER DDL` trigger the compile has not committed yet, so a dictionary read there returns the *previous* version of the object. The trigger therefore hashes the statement it was handed, never the dictionary. Get that backwards and every lock quietly records the version it just overwrote.
-
-### Unlock
-
-`unlock` releases a lock. At least one of `in_lock_id`, `in_locked_by`, or `in_object_name` must be passed, otherwise it raises `ARGUMENTS_MISSING`. Reports each released object through `DBMS_OUTPUT`.
+ALICE locks the whole application for a deploy:
 
 ```sql
 BEGIN
-    core_lock.unlock(in_object_name => 'MY_PACKAGE');   -- free one object
-    core_lock.unlock(in_locked_by   => 'JAN');          -- free everything a user holds
+    core_lock.create_lock(
+        in_app_id           => 9901,
+        in_comment          => 'Deploy 4711'
+    );
+END;
+/
+
+SELECT core_lock.get_lock(in_app_id => 9901) AS app_owner FROM dual;
+```
+
+```text
+APP_OWNER
+--------------------------------------------------------------------------------
+ALICE
+```
+
+BOB wants to rework one page of it:
+
+```sql
+BEGIN
+    core_lock.create_lock(
+        in_app_id           => 9901,
+        in_page_id          => 1,
+        in_comment          => 'Reworking the grid'
+    );
 END;
 /
 ```
 
-### Extend lock
-
-`extend_lock` pushes the expiry out and refreshes the stored source and hash. Overloaded – pass a number of days, or an explicit date.
-
-```sql
-core_lock.extend_lock(in_lock_id => 10001, in_time => 60/1440);   -- +60 minutes
-core_lock.extend_lock(in_lock_id => 10001, in_expire_at => SYSDATE + 1);
+```text
+ORA-20990: APP_LOCK_ERROR: APP_LOCKED_BY `ALICE` [9901]
 ```
 
-### Purge
-
-`purge_locks` is the retention rule, run daily at 03:00 by the `CORE_LOCKS_PURGE` job. Rows younger than `g_purge_after` (7 days) are never touched, and neither is any still-live lock. Beyond the window, each unique object collapses to its newest row – that row keeps the SHA-256 hash, owner, and timestamps but has its `object_payload` CLOB set to NULL; the older history rows are deleted. Safe to run by hand; it reports its row counts through `DBMS_OUTPUT`.
+ALICE finishes the deploy and unlocks, BOB takes the page, and now ALICE is the one refused on it:
 
 ```sql
-core_lock.purge_locks();
+BEGIN
+    core_lock.unlock(
+        in_app_id           => 9901
+    );
+END;
+/
 ```
 
-### Raise error
-
-`raise_error` raises `ORA-20990` carrying the message, with `keeperrorstack` on. It is public because the trigger calls it from its own `WHEN OTHERS`. The matching `core_lock.app_exception` is pinned to the same code, so an APEX error handler already tuned to CORE23 keeps recognizing these errors unchanged.
-
-### APEX application and page locks
-
-Your database objects are not the only thing two developers overwrite. So the package locks APEX applications and pages as well, under the same name `get_user` gives a DDL lock, which is why the README keeps telling you to use your Builder name everywhere. Pass `in_locked_by` to lock for somebody else, a deploy account for example.
-
-```sql
-core_lock.create_lock   (in_app_id => 100, in_comment => 'Deploy 4711');
-core_lock.unlock        (in_app_id => 100);
-core_lock.get_lock      (in_app_id => 100);                     -- owner, NULL when free
-
-core_lock.create_lock   (in_app_id => 100, in_page_id => 10, in_comment => 'Reworking the grid');
-core_lock.unlock        (in_app_id => 100, in_page_id => 10);
-core_lock.get_lock      (in_app_id => 100, in_page_id => 10);
+```text
+APP 9901 UNLOCKED
+ORA-20990: PAGE_LOCK_ERROR: PAGE_LOCKED_BY `BOB` [9901:1]
 ```
 
-`create_lock` and `unlock` raise `ORA-20990` like the rest of the package, with a message you can act on:
+The locks are the ones the Builder shows, under the same name a DDL lock carries.
+
+- **The application lock wins.** A page inside an application somebody else holds is refused.
+- **One name, one owner.** APEX compares application lock owners case-insensitively and page lock owners case-sensitively, so every name goes through `clean_user` and is uppercased.
+- **Unlock only releases your own lock.** APEX's own unlock with a NULL user frees anybody's, so a failed deploy would free a colleague's application; `unlock` never does that.
+- **An import keeps the application lock and drops every page lock.** Call `get_lock` before a deploy, and check `apex_application_locked_pages` for whose page work the import is about to unlock.
+- **Pass `in_locked_by`** to lock for somebody else, a deploy account for example.
+- **Call page locks from a script or SQL**, not from inside a running page request. They go through the package Page Designer uses, which resets the OWA context and the HTP buffer.
+- **Both commit on their own**, so the Builder and other sessions see the lock straight away.
 
 | Message | Meaning |
 | --- | --- |
-| `APP_LOCK_ERROR: APP_LOCKED_BY \`JAN\` [100]` | somebody else holds the application |
-| `PAGE_LOCK_ERROR: PAGE_LOCKED_BY \`JAN\` [100:10]` | somebody else holds the page |
-| `USER_ERROR: NOT_A_WORKSPACE_DEVELOPER \`CI\`` | APEX locks applications only for developers of that workspace |
-| `USER_ERROR: GRANT_WWV_FLOW_PROPERTY_DEV` | page locks need the grant from [Prerequisites](#2-prerequisites--requirements) |
-| `APEX_VERSION_ERROR: LOCK_APP_NEEDS_APEX_26_2` | there is no application lock API before 26.2 |
+| ``APP_LOCK_ERROR: APP_LOCKED_BY `ALICE` [100]`` | somebody else holds the application |
+| ``PAGE_LOCK_ERROR: PAGE_LOCKED_BY `BOB` [100:10]`` | somebody else holds the page |
+| ``USER_ERROR: NOT_A_WORKSPACE_DEVELOPER `CI` `` | APEX locks applications only for developers of that workspace |
+| `USER_ERROR: GRANT_WWV_FLOW_PROPERTY_DEV` | page locks need the grant from [Installation & Setup](#7-installation--setup) |
+| `APEX_VERSION_ERROR: LOCK_APP_NEEDS_APEX_26_2` | there is no application lock API before APEX 26.2 |
 | `APP_ERROR: APP_NOT_FOUND [100]` | the schema cannot see that application |
 | `PAGE_LOCK_ERROR: PAGE_NOT_LOCKED [100:10]` | APEX did not lock the page, a page that does not exist for example |
 
-A few things worth knowing before you put these into a pipeline:
+<br>
 
-- **Unlock only ever releases your own lock.** `APEX_APPLICATION_ADMIN.UNLOCK_APPLICATION` with a NULL user removes anybody's lock, so a failed deploy would happily free a colleague's application. `unlock` never passes NULL, and it refuses a lock somebody else holds.
-- **APEX compares application lock owners case-insensitively, and page lock owners case-sensitively.** Every name goes through `clean_user`, which uppercases it, so you never get two `jan`s.
-- **An import keeps the application lock (26.2) and drops every page lock.** So call `get_lock` before a deploy: it names whoever holds the application, and `apex_application_locked_pages` shows whose page work the import is about to unlock.
-- **A page inside an application somebody else holds is refused too.** The application lock wins.
-- **The page lock package is undocumented.** It reads the holder from `APP_USER`, answers in JSON through the HTP buffer and never raises, so `create_lock` and `unlock` set `APP_USER` for a page call, hands the session its own value back afterwards, and reads the lock row back as the only proof it worked. Call it from a script or SQL, not from inside a running APEX page request, since it resets the OWA context and the HTP buffer.
+## 4. API Reference
 
-`create_lock` and `unlock` commit on their own, so a lock is visible to the Builder and other sessions straight away.
+Every procedure that writes runs as an autonomous transaction and commits on its own; it has to, since a DDL trigger drives it.
+
+<br>
+
+### Create lock
+
+`create_lock` is what the trigger calls on every compile, and it takes a lock by hand just as well: to hold an object before a deploy, or to book one before you start editing it.
+
+```sql
+BEGIN
+    core_lock.create_lock(
+        in_object_owner     => 'APPS',
+        in_object_type      => 'PACKAGE BODY',
+        in_object_name      => 'MY_PACKAGE',
+        in_locked_by        => NULL,     -- defaults to get_user()
+        in_expire_at        => NULL,     -- defaults to now + g_lock_length
+        in_hash_check       => TRUE
+    );
+END;
+/
+```
+
+- **Called by hand, the backup comes from the dictionary.** `user_source` for packages, package bodies, procedures, functions and triggers, `user_views` for a view, `DBMS_METADATA.GET_DDL` for anything else, a table being the usual one.
+- **An object the dictionary has nothing for is still locked,** just without a backup.
+- **A hand lock and a compile lock fingerprint the same object identically.** The dictionary quotes and qualifies the name, adds `EDITIONABLE` and prints a view's column list, so the hash is taken without the header.
+- **`GET_DDL` reprints, it does not repeat.** Asked for a `PACKAGE` it returns the spec and the body, asked for a `TRIGGER` it appends `ALTER TRIGGER ... ENABLE`, which is why the dictionary's own source columns are read first.
+
+<br>
+
+### Unlock
+
+`unlock` releases locks and reports each one through `DBMS_OUTPUT`. Pass at least one of `in_lock_id`, `in_locked_by` or `in_object_name`, otherwise it raises `ARGUMENTS_MISSING`.
+
+```sql
+BEGIN
+    core_lock.unlock(
+        in_object_name      => 'MY_PACKAGE'     -- free one object
+    );
+    --
+    core_lock.unlock(
+        in_locked_by        => 'JAN'            -- free everything a user holds
+    );
+END;
+/
+```
+
+<br>
+
+### Extend lock
+
+`extend_lock` pushes the expiry out and refreshes the stored source and hash. Pass a number of days, or an explicit date.
+
+```sql
+BEGIN
+    core_lock.extend_lock(
+        in_lock_id          => 10001,
+        in_time             => 60/1440          -- +60 minutes
+    );
+    --
+    core_lock.extend_lock(
+        in_lock_id          => 10001,
+        in_expire_at        => SYSDATE + 1
+    );
+END;
+/
+```
+
+<br>
+
+### Application and page locks
+
+The APEX overloads, shown in action in [APEX](#3-apex):
+
+```sql
+BEGIN
+    core_lock.create_lock(
+        in_app_id           => 100,
+        in_page_id          => 10,              -- leave out for the whole application
+        in_locked_by        => NULL,            -- defaults to get_user()
+        in_comment          => 'Reworking the grid'
+    );
+    --
+    core_lock.unlock(
+        in_app_id           => 100,
+        in_page_id          => 10
+    );
+END;
+/
+
+SELECT core_lock.get_lock(in_app_id => 100, in_page_id => 10) AS owner FROM dual;   -- NULL when free
+```
+
+<br>
+
+### Purge
+
+`purge_locks` is the retention rule, run daily at 03:00 by the `CORE_LOCKS_PURGE` job, and safe to run by hand. It reports its row counts through `DBMS_OUTPUT`.
+
+```sql
+BEGIN
+    core_lock.purge_locks();
+END;
+/
+```
+
+- Rows younger than `g_purge_after` (7 days) are never touched, and neither is a live lock.
+- Older history collapses to the newest row per object, which keeps the hash, owner and timestamps but loses its `object_payload`.
+
+<br>
+
+### Raise error
+
+`raise_error` raises `ORA-20990` carrying the message, with `keeperrorstack` on. It is public because the trigger calls it from its own `WHEN OTHERS`. `core_lock.app_exception` is pinned to the same code CORE23 and CORE_LOGS use, so one APEX error handler recognizes all of them.
+
+<br>
 
 ### Helpers
 
-`get_user`, `clean_user`, `recover_user`, `get_audit_trail`, `get_object`, and `get_clob_hash` are exposed for diagnostics. `get_object` reads the DDL statement through `ora_sql_txt` inside a trigger; called by hand it falls back to the dictionary, so pass it the type and the name (`core_lock.get_object('PACKAGE BODY', 'MY_PACKAGE')`) or it has nothing to look up.
+Exposed for diagnostics:
 
-`clean_user` strips the trailing session number, drops anything that names no person, and uppercases what is left. It is public for one practical reason: it is the same rule the lock rows were written with, so you can point it at history you inherited from an older install and see who the owners really were.
+- **`get_user()`** returns the name the next lock row will carry, see [where it comes from](#where-the-name-comes-from).
+- **`clean_user(in_name)`** strips a trailing session number, uppercases the rest, and returns NULL for a bare number or a pool account.
+- **`recover_user()`** returns the name this workstation compiled under last time.
+- **`get_object(in_object_type, in_object_name)`** returns the normalized DDL a lock row would store. Called by hand it reads the dictionary, so pass the type and the name: `core_lock.get_object('PACKAGE BODY', 'MY_PACKAGE')`.
+- **`get_audit_trail()`** returns the address, host, time zone and module of the current session, the string every lock row keeps in `audit_trail`.
+- **`get_clob_hash(in_payload)`** returns the SHA-256 of a CLOB as hex.
+
+`clean_user` is the same rule the lock rows are written with, so you can point it at history inherited from an older install:
 
 ```sql
 SELECT DISTINCT
@@ -367,45 +395,36 @@ FROM core_locks t
 ORDER BY 1;
 ```
 
-Tidying those rows up is worth it when the old values carried a session number, because two rows for the same person no longer look like two people:
-
 ```sql
 UPDATE core_locks t
 SET t.locked_by     = core_lock.clean_user(t.locked_by)
 WHERE core_lock.clean_user(t.locked_by) IS NOT NULL;
 ```
 
-The `IS NOT NULL` guard matters. `locked_by` is mandatory, and a row whose owner was only ever a number has nothing to clean it down to, so leave those as they are.
+Keep the `IS NOT NULL` guard: `locked_by` is mandatory, and an owner that was only ever a number has nothing to clean down to.
 
----
+<br>
 
-## 7. Configuration
+## 5. Configuration
 
 Constants at the top of the package body:
 
 | Constant | Default | Meaning |
-|---|---|---|
-| `g_lock_length` | 20 minutes | How long a new lock stays live |
-| `g_lock_rebook` | 10 minutes | Age past which a new backup row is cut instead of extending |
-| `g_check_hash` | `TRUE` | Master switch for the source-hash comparison |
-| `g_purge_after` | 7 days | History younger than this is never purged |
-| `c_anon_users` | pool and process accounts | Names `clean_user` refuses, colon delimited |
+| --- | --- | --- |
+| `g_lock_length` | 20 minutes | how long a lock stays live after a compile |
+| `g_lock_rebook` | 10 minutes | age past which a compile cuts a new backup row instead of extending |
+| `g_check_hash` | `TRUE` | master switch for the source hash comparison |
+| `g_purge_after` | 7 days | history younger than this is never purged |
+| `c_anon_users` | pool and process accounts | names `clean_user` refuses, colon delimited |
 
 Lock numbering starts at 10000, assigned by the identity column on `core_locks.lock_id`.
 
----
+<br>
 
-## 8. Operational Notes
+## 6. Operational Notes
 
-**This trigger can block every DDL in the schema.** It is `AFTER DDL ON SCHEMA` and it raises. A bug in `core_lock`, a missing `DBMS_CRYPTO` grant, or a session with neither a name nor an IP address will fail *all* DDL, including the DDL needed to fix the package. Install it on a dev schema first and understand the escape hatch before putting it anywhere that matters.
-
-**The escape hatch is not just disabling the trigger.** `CORE_LOCKSMITH_ENABLE` is a scheduler job that runs `ALTER TRIGGER CORE_LOCKSMITH ENABLE` every five minutes. That is the point – it stops the trigger from being quietly switched off and left off. But it also means this is not enough:
-
-```sql
-ALTER TRIGGER core_locksmith DISABLE;   -- comes back within 5 minutes
-```
-
-To actually stop the feature you must disable the job as well:
+- **The trigger can block every DDL in the schema.** A bug in `core_lock`, a missing `DBMS_CRYPTO` grant or a session with no name fails all DDL, including the DDL that would fix it. Install it on a dev schema first.
+- **Disabling the trigger is not enough.** `CORE_LOCKSMITH_ENABLE` switches it back on every five minutes, so it cannot be quietly left off. To stop the feature, drop the job too:
 
 ```sql
 BEGIN
@@ -415,11 +434,9 @@ END;
 /
 ```
 
-**It affects everyone on the schema, not just you.** On a shared dev database, installing this changes the deployment experience for every developer and every automated pipeline touching that schema. That is the feature working as intended, but it is a team decision rather than a personal one.
-
-**`core_locks` grows – the purge job caps it.** Every rebook writes a new row carrying a full CLOB copy of the object source, and the CLOB is where virtually all of the segment size lives. The `CORE_LOCKS_PURGE` job (daily, 03:00) applies the retention rule: the last 7 days stay untouched as a working source backup; beyond that, each unique object keeps exactly one row (its newest, with the hash but without the payload) and the rest of the history is deleted. Live locks are never touched. The trade-off is deliberate: after 7 days you lose the old source text and the per-compile history, but you keep who last touched each object, when, and its source fingerprint.
-
-Freed space is reused by new rows, so the segment stops growing but does not shrink on its own. To hand space back to the tablespace after the first purge of a large backlog, run once:
+- **It changes the day of everyone on the schema,** every developer and every pipeline. Install it as a team decision.
+- **The purge job caps the table.** The last 7 days stay as they are, older history collapses to one hash-only row per object, live locks are never touched.
+- **Freed space is reused, not returned.** After the first purge of a large backlog, hand it back once:
 
 ```sql
 ALTER TABLE core_locks ENABLE ROW MOVEMENT;
@@ -427,124 +444,176 @@ ALTER TABLE core_locks SHRINK SPACE CASCADE;
 ALTER TABLE core_locks DISABLE ROW MOVEMENT;
 ```
 
----
+<br>
+
+## 7. Installation & Setup
+
+### Requirements
+
+- Oracle Database 23ai or later, Oracle Database Free included (`CREATE TABLE IF NOT EXISTS`, identity columns).
+- APEX installed, because `get_object` uses `APEX_STRING`.
+- Two grants from `SYS`:
+
+```sql
+GRANT EXECUTE ON dbms_crypto TO <schema>;      -- SHA-256 source hashing
+GRANT EXECUTE ON dbms_scheduler TO <schema>;   -- the locksmith enable job
+```
+
+- Application locks need APEX 26.2 or newer; on older versions they raise `APEX_VERSION_ERROR` and everything else works.
+- Page locks need one more grant from `SYS`, and only if you use them:
+
+```sql
+GRANT EXECUTE ON <APEX schema>.wwv_flow_property_dev TO <schema>;
+```
+
+<br>
+
+### Install
+
+Run these in this order, since the package body needs the table and the trigger needs the package:
+
+```text
+database/tables/core_locks.sql
+database/packages/core_lock.spec.sql
+database/packages/core_lock.sql
+database/triggers/core_locksmith.sql
+database/jobs/core_locksmith_enable.sql
+database/jobs/core_locks_purge.sql
+```
+
+Both jobs are optional but recommended, see [Operational Notes](#6-operational-notes).
+
+<br>
+
+### Check it works
+
+1) Put a name on your session, see [Proxy Users & Startup Script](#8-proxy-users--startup-script).
+2) Compile any package in the schema.
+3) Find your lock:
+
+```sql
+SELECT t.lock_id, t.object_name, t.locked_by, t.expire_at
+FROM core_locks t
+ORDER BY t.lock_id DESC
+FETCH FIRST 1 ROW ONLY;
+```
+
+Then ask a colleague to compile the same package.
+
+<br>
+
+## 8. Proxy Users & Startup Script
+
+A lock is only useful when you know who to call. Pick one of these two for the whole team.
+
+<br>
+
+### Proxy users (recommended)
+
+Each developer gets a personal login and connects through it to the shared schema. Nobody needs the schema password.
+
+1) As a DBA, once per developer:
+
+```sql
+CREATE USER jan IDENTIFIED BY "SomeStrongPassword#1";
+GRANT CREATE SESSION TO jan;
+
+ALTER USER apps GRANT CONNECT THROUGH jan;
+```
+
+2) The developer connects as `jan[apps]` with their own password. In SQL Developer the same string goes into the username field.
+
+```sql
+CONNECT jan[apps]/"SomeStrongPassword#1"@dev_db
+```
+
+3) Taking the access away is one statement:
+
+```sql
+ALTER USER apps REVOKE CONNECT THROUGH jan;
+```
+
+The session runs as `apps` with all its privileges, and the lock rows say `JAN`. Nothing to run after connecting.
+
+<br>
+
+### Startup script
+
+No DBA willing to create users? Then each session names itself:
+
+```sql
+BEGIN
+    DBMS_SESSION.SET_IDENTIFIER('JAN');
+END;
+/
+```
+
+- **Use the name you have in the APEX Builder.** `JAN` in the browser and `JKVETINA` in SQL Developer are two colleagues who keep locking each other out, and both of them are you.
+- **Run it on every connect,** since the identifier is gone after a reconnect:
+	- SQL Developer: Tools, Preferences, Database, "Filename for connection startup script".
+	- SQLcl and SQL\*Plus: `login.sql`, read from `SQLPATH` or `ORACLE_PATH`.
+	- Other tools: their logon or post-connect script hook.
+
+<br>
+
+### Check your name
+
+```sql
+SELECT core_lock.get_user() AS me FROM dual;
+```
+
+```text
+ME
+--------------------------------------------------------------------------------
+BOB
+```
+
+- **A name** is what your colleagues will see in `OBJECT_LOCKED_BY`.
+- **An IP address** means nothing named your session and the fallback took over, so your colleagues would see ``OBJECT_LOCKED_BY `10.20.30.44` ``. Go back to one of the two options above.
+- **NULL** means your next compile is refused with `USER_ERROR: USE_PROXY_USER_OR_SET_CLIENT_ID`.
+
+Run it again after `APEX_SESSION.ATTACH`. It should still be your name.
+
+<br>
+
+### Where the name comes from
+
+`get_user` takes the first of these that names a person:
+
+| Order | Source | Where it comes from |
+| --- | --- | --- |
+| 1 | `PROXY_USER` | the database authenticated the person, nothing beats that |
+| 2 | `CLIENT_IDENTIFIER` | your startup script or APEX, as long as nothing overwrote it |
+| 3 | `recover_user` | who this same workstation compiled as last time, asked when the identifier is a context key or a bare number |
+| 4 | `APEX$SESSION.APP_USER` | the application user, a company account behind an SSO login |
+| 5 | `CLIENT_IDENTIFIER` again | the name left inside a context key, once the key part is stripped |
+| 6 | `CLIENT_INFO` | the same idea, minus any prefix a job put in front of it |
+| 7 | `OS_USER` | your desktop login, for an editor you never configured |
+| 8 | `IP_ADDRESS` | not a person, but traceable |
+
+- **Every name is uppercased,** so `Jan`, `JAN` and `jan` are one developer.
+- **`clean_user` filters every candidate.** It strips a trailing session number (`JAN:12345678` and `JAN_100_12345678901234` both become `JAN`) and drops anything that is only digits or names a pool account (`ORDS_PUBLIC_USER`, `ANONYMOUS`).
+- **An attached APEX session keeps your name.** `APEX_SESSION.ATTACH` overwrites the identifier with whatever the application's context code puts there. `recover_user` then reads the `audit_trail` history (address and host of the workstation) and finds the name this machine compiled under last time.
+- **The recovery only repairs, it never invents.** It runs only when the identifier names nobody. A session with no identifier at all falls through to the OS user and the IP address.
+- **Attaching a colleague's session on a machine with no history makes you them.** Detach when you are done:
+
+```sql
+BEGIN
+    APEX_SESSION.DETACH();
+END;
+/
+```
+
+- **A shared host (Citrix, NAT) shares one IP address** and one history, so the fallback cannot tell people apart. Give those people proxy users.
+- **A local connection on the database server and a scheduler job have no address** and run as the database's own OS account, so they are refused.
+
+<br>
 
 ## 9. Tests
 
-There are 101 utPLSQL tests in six suites, and they cover every public routine in `core_lock`, every optional argument those routines take, the `core_locksmith` trigger across all three events and every tracked object type, and the three things one session cannot show about itself: a lock seen from another session, an owner the database vouched for, and a session with no name at all.
+- 101 utPLSQL tests in six suites cover every public routine, every optional argument, and the trigger across all three events and every tracked object type.
+- Separate connections test a proxy user and a session with no address, since neither can be faked from inside one session.
+- Mutation sweeps broke the code on purpose, and every break was caught.
+- GitHub Actions runs everything on every push and pull request.
 
-| File | What it holds |
-| --- | --- |
-| `database/tests/core_lock_ut.spec.sql` / `.sql` | The package API, called directly. 51 tests |
-| `database/tests/core_locksmith_ut.spec.sql` / `.sql` | The DDL trigger, driven by real compiles. 15 tests |
-| `database/tests/core_lock_conc_ut.spec.sql` / `.sql` | Two sessions at once, borrowed from the scheduler. 4 tests |
-| `database/tests/core_lock_proxy_ut.spec.sql` / `.sql` | Ownership through a proxy connection. 5 tests |
-| `database/tests/core_lock_anon_ut.spec.sql` / `.sql` | The refusal of a session that names nobody. 4 tests |
-| `database/tests/core_lock_apex_ut.spec.sql` / `.sql` | APEX application and page locks. 22 tests |
-| `database/tests/core_lock_fixture.spec.sql` / `.sql` | Actor, probe objects, second sessions, teardown ledger |
-| `database/tests/create_test_user.sql` | Creates the throwaway schema and its proxy account, run as SYSDBA |
-| `database/tests/install.sql` | Installs product and suites, then proves the install |
-| `database/tests/run.sql` | Runs everything except the `proxy`, `anon` and `apex` tags, and fails the session when it is not green |
-| `database/tests/run_proxy.sql` | Runs the proxy tag, and refuses a connection that has no proxy user |
-| `database/tests/run_anon.sql` | Runs the anon tag, and refuses a connection that has an address |
-| `database/tests/run_anon.sh` | Reaches a local connection inside the database's container |
-| `database/tests/create_test_apex.sql` | Creates the APEX workspace, its two developers and the page lock grant, run as SYSDBA |
-| `database/tests/install_apex.sql` / `core_lock_apex_app.sql` | Installs the two-page application the apex suite locks |
-| `database/tests/run_apex.sql` | Runs the apex tag |
-| `database/tests/run.sh` | Does all of the above from any working directory |
-
-You need utPLSQL v3 (measured against v3.2.3.4508 on 23ai) and the same `APEX_STRING` and `DBMS_CRYPTO` access the feature itself needs.
-
-```
-sqlplus "sys/<password>@<host>:<port>/<service> as sysdba" @database/tests/create_test_user.sql
-database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service> --anon
-```
-
-### Three connections, because three of the tests cannot be faked
-
-`run.sh` makes up to three connections, because what two of the suites test is decided when a session connects and can never be arranged from inside one.
-
-| Connection | Suites | Tests | Why it has to be its own connection |
-| --- | --- | --- | --- |
-| ordinary | unit, trigger, concurrency | 70 | it is the plain connection everything else is measured against |
-| `CLUT_PROXY[CORE_LOCKS]` | proxy | 5 | `PROXY_USER` is fixed at connect time |
-| local IPC, inside the host | anon | 4 | only a connection with no IP address resolves to nobody |
-
-The proxy connect string is derived from the first, so the command above is still the whole thing; pass `-x` to give it explicitly, or `--no-proxy` to skip it and be told on stdout that `PROXY_USER` went untested.
-
-The anon run is opt-in rather than opt-out, because it needs a shell on the database host and the ordinary caller of `run.sh` does not have one. Without `--anon` it says so on stdout for the same reason `--no-proxy` does. `--anon [container]` delegates to `run_anon.sh`, which steps inside the container and connects over IPC; the SQL arrives on stdin rather than as an `@` path, since the repository is not mounted in there and a script the container cannot open looks exactly like an empty green run.
-
-Both suites are tagged out of `run.sql` rather than left out of the install. Left in, they would fail on every ordinary run for the connection's reason rather than the product's, and the usual answer to that is `%disabled`, which is a test that never runs again. `run_proxy.sql` and `run_anon.sql` ask for their tag by name and raise when they find fewer tests than the suite declares, so a tag that stops matching is loud instead of quiet.
-
-The apex suite needs no special connection, it needs an APEX 26.2 workspace on the schema, which only `SYS` can create. So it is opt-in the same way: run `create_test_apex.sql` as SYSDBA once, then pass `--apex`, which installs the fixture application and runs the tag. Without it `run.sh` says the APEX locks went untested.
-
-```
-sqlplus "sys/<password>@<host>:<port>/<CDB service> as sysdba" @database/tests/create_test_apex.sql
-database/tests/run.sh -c core_locks/core_locks@<host>:<port>/<service> --apex
-```
-
-The concurrency suite needs no second connection. It hands its work to a `DBMS_SCHEDULER` job, which runs in a slave session with its own SID and its own transaction, so a lock really does have to cross between two sessions to be seen.
-
-### The anonymous session, and why it takes a third connection
-
-`get_user` ends its ladder on `SYS_CONTEXT('USERENV', 'IP_ADDRESS')`, so any session reached over TCP resolves to something and the refusal of an anonymous session is unreachable from one. A local IPC or bequeath connection carries no address at all, and the OS user behind it is the database's own service account, which `clean_user` reduces to nobody like any other pool account. That is the only connection on which the guard can fire.
-
-utPLSQL sets the client identifier to the name of the test it is about to run, which is the second rung of that same ladder. A session stripped in `before_each` is therefore named again (after the anon suite's own test, of all things) before the body starts, so each test here strips the session as its first statement instead.
-
-Two things enforce the anonymous rule, not one: `create_lock` checks its resolved owner, and the trigger checks earlier so the error arrives before an autonomous transaction opens. Removing either one on its own changes nothing observable, which the mutation sweep confirms. `core_locks.locked_by` is `NOT NULL`, so with both removed the insert fails and the compile is still refused under the same catalogue code. That is why both refusal tests assert the message and not just the code.
-
-### Give the suite a schema of its own
-
-`core_locksmith` is an `AFTER DDL ON SCHEMA` trigger, so it governs every `CREATE`, `ALTER` and `DROP` in whatever schema it lives in. Install it beside other work and that work inherits it, and if `core_lock` ever goes invalid its `WHEN OTHERS` handler raises and no DDL in that schema succeeds until somebody drops the trigger. So the suite gets a throwaway schema and nothing else shares it.
-
-The two scheduler jobs are not installed by `install.sql`. `CORE_LOCKSMITH_ENABLE` re-enables the trigger every five minutes, and the unit suite switches it off while it compiles its probes, so the job would switch it back on mid-run.
-
-### Every suite owns its own cleanup
-
-`create_lock`, `extend_lock`, `unlock` and `purge_locks` all carry `PRAGMA AUTONOMOUS_TRANSACTION` and commit inside themselves, and the trigger suite runs DDL, which commits too. There is no savepoint left for utPLSQL to roll back to, so every suite declares `%rollback(manual)`, the fixture commits on purpose, and cleanup is the suite's job. `after_each` tears down, counts what survived, and asserts that the count is zero and that teardown recorded no error. A teardown that swallows its failure is the appearance of cleanup, and with committed fixtures the leftovers are permanent.
-
-The concurrency suite adds scheduler jobs to that count. A racer left behind does not sit still: its start time arrives during somebody else's test and it takes a lock nobody asked for.
-
-### One holder, measured rather than guaranteed
-
-`create_lock` reads the lock history and then inserts, with nothing serialising the two. The race test releases four sessions at one shared start time rather than launching them one after another, since four calls in sequence is not a race and would pass whatever the code did about simultaneity. Measured on 26ai across six runs of four to six sessions, exactly one holder every time, the rest refused. That is an outcome, not a promise the code makes, and it is written down here so nobody reads the green as a serialisation guarantee.
-
-The test asserts how many racers actually ran before it asserts anything about the result, because one holder is also what an empty table looks like, and a race that never started reads exactly like a guard that worked.
-
-### Every test has been seen red
-
-Green proves a suite runs; only red proves it asserts. Each of the 77 tests has been failed on purpose by breaking the behaviour it covers, one piece at a time: the header strip in `object_body`, the hash check and the expiry check in `create_lock`, each rule in `clean_user`, every optional argument thrown away in turn, the chunked `LONG` read in `view_query`, the retention window in `purge_locks`, the name, type and event filters in the trigger, the proxy user's place at the top of the ownership ladder, the lock row an extend reads its payload from, and the history read that would stop seeing other sessions if it were scoped to this one. Sixty-six separate breakages across four sweeps, every one of them caught, and every test died to at least one.
-
-The apex suite got its own sweep of 18 breakages, from a lock that drops its comment to an unlock that uses the NULL admin hammer, a page lock that ignores the application lock and a failed page call that keeps the borrowed `APP_USER`. Every one was caught, and each of the 22 tests died to at least one. It found one product bug on the way: APEX raises the same `ORA-20003` for every invalid parameter, so a comment over 4000 characters came back as `NOT_A_WORKSPACE_DEVELOPER` until the translation started reading the parameter name.
-
-A mutation is anchored on the text around it and asserts how many places it expects to match. `extend_lock`'s two overloads carry byte-identical `UPDATE` bodies, so an unanchored find-and-replace hits the first one, leaves the overload under test untouched, and reports a surviving mutant that reads exactly like a coverage hole.
-
-The proxy suite's first test is the exception that proves the rest of it: it asserts the connection really is a proxy connection, so no product mutation can kill it. Its red comes from the other direction, by running the suite on an ordinary connection, where all five fail. Without it, the four that matter would pass on a database with no proxy in it by falling through the ladder to whatever the session happened to offer.
-
-That discipline found two tests that could not fail as first written. One compared a hand-booked lock against a compiled one using probe source whose `CREATE` header was already spelled the way the dictionary spells it, so the two texts matched with the header left on and the strip stopped mattering. The probe headers are lower case and doubly spaced now, which is what a developer actually types and what normalisation cannot close. The other checked the self-exclusion rule by recompiling the trigger itself, and Oracle does not fire a schema DDL trigger for DDL on that same trigger, so the assertion never had anything to be wrong about.
-
-It also found two product bugs, both in behaviour the code claimed to have. A `DROP` was fingerprinted against the object it was destroying and refused as somebody else's change, and a materialized view was tracked under a name the dictionary never uses. Neither showed up in a review of the same code that wrote them.
-
-### Coverage
-
-84.9% of the 305 lines utPLSQL can cover in `core_lock`, taken at `PLSQL_OPTIMIZE_LEVEL` 2 on APEX 26.2. Most of what stays uncovered in the APEX part cannot run there at all: the version error below 26.2, the fallback for an APEX without lock columns, the missing grant, a page unlock APEX ignored, and an owner-less session, which only the anon connection can make. Quote the optimize level with the number or it does not mean anything; the same code reports several points higher at level 2 than at level 1. Treat it as a floor rather than a target: the next run may not be lower.
-
-`core_locksmith` contributes no lines to that denominator at all, because the profiler does not instrument a DDL trigger, so the tool reports it with a blank line count rather than a low percentage. The 15 tests in the trigger suite drive it through real compiles, and the mutation sweep breaks it on purpose, which is the only evidence that it runs at all. It is also why the tests added for the trigger's own branches move the number by nothing: those lines were never being counted.
-
-Measured over the 90 tests of the ordinary connection, the apex suite included. A coverage runner that selects by suite name has to name the four suites that connection can reach, since neither the proxy suite nor the anon suite can pass on the connection a coverage run makes:
-
-```
-adtai ut -schema CORE_LOCKS -name CORE_LOCK_UT,CORE_LOCKSMITH_UT,CORE_LOCK_CONC_UT,CORE_LOCK_APEX_UT -refresh -compact
-```
-
-### Continuous integration
-
-`.github/workflows/tests.yml` runs the whole thing (all three connections) on every push and pull request.
-
-It runs on a self-hosted macOS runner rather than a GitHub-hosted one, and the reason is `APEX_STRING`. A hosted runner would have to stand up Oracle Free and then install APEX into it before a single test could run, which is roughly half an hour of setup in front of a four-second suite; the self-hosted runner talks to a database that already has both. It also makes the anon suite reachable, which needs a shell on the database host.
-
-The workflow names no path on that machine. The connect string defaults to the throwaway one `create_test_user.sql` already documents, and `CORE_LOCKS_SQLPLUS` and `CORE_LOCKS_CONTAINER` are repository variables with defaults, so the runner's own environment decides where `sqlplus` and the container runtime live.
-
-The first step asks the database whether it is open, as its own named step. A database that is down fails every later step anyway, but it fails them as "the tests did not pass", which is the one thing it does not mean.
-
-The job is guarded against forks. This repository is public and the runner is somebody's own machine, so a pull request opened from a fork would be a stranger's code running on it. The job's `if` holds for a push and for a pull request raised from a branch of this repository, and fails for every fork, which skips the job rather than running it.
+How the suites are built, why they need three connections, coverage and CI: [docs/tests.md](docs/tests.md).
